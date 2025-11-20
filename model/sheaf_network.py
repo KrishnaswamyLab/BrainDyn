@@ -156,3 +156,50 @@ class SheafGeometry(nn.Module):
         for _ in range(k):
             Y = self.incidence.laplacian_apply(Y, edge_index)
         return Y
+
+
+####THIS IS WHAT WE ARE USING!! DO NOT LOOK ABOVE####
+
+class SheafIncidenceFast(nn.Module):
+    def __init__(self, num_edges, F_node, hidden_dim=32):
+        super().__init__()
+        self.F_node = F_node
+        self.num_edges = num_edges
+
+        # Shared MLPs with per-edge embeddings
+        self.edge_emb = nn.Embedding(num_edges, hidden_dim)
+        self.mlp_src = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, F_node * F_node)
+        )
+        self.mlp_tgt = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, F_node * F_node)
+        )
+
+    def _restriction_matrices(self):
+        E, F = self.num_edges, self.F_node
+        R_src = self.mlp_src(self.edge_emb.weight).view(E, F, F)
+        R_tgt = self.mlp_tgt(self.edge_emb.weight).view(E, F, F)
+        return R_src, R_tgt
+
+    def edge_disagreement(self, X, edge_index):
+        src, tgt = edge_index
+        R_src, R_tgt = self._restriction_matrices()
+        X_src, X_tgt = X[src], X[tgt]
+        h_src = torch.bmm(X_src.unsqueeze(1), R_src.transpose(1, 2)).squeeze(1)
+        h_tgt = torch.bmm(X_tgt.unsqueeze(1), R_tgt.transpose(1, 2)).squeeze(1)
+        return h_src - h_tgt
+
+    def laplacian_apply(self, X, edge_index):
+        src, tgt = edge_index
+        R_src, R_tgt = self._restriction_matrices()
+        d = self.edge_disagreement(X, edge_index)
+
+        # aggregate back to nodes
+        m = torch.zeros_like(X)
+        m.index_add_(0, src, -torch.bmm(d.unsqueeze(1), R_src).squeeze(1))
+        m.index_add_(0, tgt,  torch.bmm(d.unsqueeze(1), R_tgt).squeeze(1))
+        return m
