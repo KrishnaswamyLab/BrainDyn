@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -27,9 +28,22 @@ def main():
 
     # Build attenuated single-channel signal = feature0 * feature1
     attenuated = raw_signals_np[..., 0] * raw_signals_np[..., 1]  # (T, N)
-    signals_np = attenuated[..., None]  # (T, N, 1)
-    T, N, F = signals_np.shape
+    # keep a raw copy for plotting/visualization before normalization
+    signals_raw_np = attenuated[..., None]  # (T, N, 1)
+    T, N, F = signals_raw_np.shape
     print(f"[main] Loaded attenuated signals: T={T}, N={N}, F={F}")
+
+    # Normalize signals (global mean/std over all timesteps and nodes)
+    norm_mean = float(signals_raw_np.mean())
+    norm_std = float(signals_raw_np.std())
+    if norm_std == 0 or np.isnan(norm_std):
+        norm_std = 1.0
+
+    # Save normalization parameters for later use
+    np.savez('norm_params.npz', mean=norm_mean, std=norm_std)
+
+    # Apply normalization to create the working signal array
+    signals_np = (signals_raw_np - norm_mean) / norm_std
     signals = torch.tensor(signals_np, dtype=torch.float32, device=device)
 
     edge_index = build_edge_index(adjacency_np, device)
@@ -51,12 +65,12 @@ def main():
 
     optimizer = optim.Adam(odefunc.parameters(), lr=1e-3)
 
-    input_window = 20
-    pred_horizon = 5
-    num_epochs = 100
+    input_window = 10
+    pred_horizon = 10
+    num_epochs = int(os.environ.get("NUM_EPOCHS", 20))
     print_every = 20
 
-    dt = 1.0
+    dt = 0.1
     tspan = torch.linspace(0., pred_horizon * dt, pred_horizon + 1, device=device)
 
     print(f"[main] Starting sliding-window training (input={input_window}, pred={pred_horizon})")
@@ -67,7 +81,8 @@ def main():
     plt.figure(figsize=(12, 8))
     for i, node in enumerate(nodes_to_plot):
         plt.subplot(num_plot_nodes, 1, i + 1)
-        plt.plot(signals_np[:, node, 0], color='black')
+        # plot the original (unnormalized) attenuated signal for visualization
+        plt.plot(signals_raw_np[:, node, 0], color='black')
         plt.ylabel(f'Node {node}')
         if i == 0:
             plt.title('Raw attenuated signal (feat0 * feat1) — all timesteps')
@@ -79,7 +94,11 @@ def main():
     plt.close()
     print('[main] Saved plot: signal_feat0x1.png')
     losses = []
-    sample_preds = []   # store full pred horizon
+    sample_preds = []   # store full pred horizon (few examples)
+    sample_trues = []
+
+    losses = []
+    sample_preds = []   # store full pred horizon (few examples)
     sample_trues = []
 
     step = 0
@@ -121,10 +140,10 @@ def main():
     plt.ylabel('MSE loss')
     plt.title('Training loss')
     plt.tight_layout()
-    plt.savefig('training_loss.png', dpi=150)
+    plt.savefig('training_loss_10_norm.png', dpi=150)
     plt.close()
 
-    print('[main] Saved plot: training_loss.png')
+    print('[main] Saved plot: training_loss_10_norm.png')
    
     if len(sample_preds) > 0:
         pred_tensor = torch.stack(sample_preds, dim=0)   # (S, pred_horizon, N, F)
@@ -134,8 +153,11 @@ def main():
         true_tensor = torch.stack(sample_trues, dim=0)   # (S, pred_horizon, N, F)
 
         # Extract single-channel attenuated values
+        # Denormalize before plotting
         pred_vals = pred_tensor[..., 0].numpy()   # (S, pred_horizon, N)
         true_vals = true_tensor[..., 0].numpy()   # (S, pred_horizon, N)
+        pred_vals = pred_vals #* norm_std + norm_mean
+        true_vals = true_vals #* norm_std + norm_mean
         num_plot_nodes = 6
         nodes_to_plot = list(range(min(num_plot_nodes, N)))
 
@@ -152,13 +174,10 @@ def main():
                 plt.xlabel('Training sample index')
 
         plt.tight_layout()
-        plt.savefig('train_multistep_attenuated.png', dpi=150)
+        plt.savefig('train_multistep_attenuated_10_norm.png', dpi=150)
         plt.close()
 
-        print('[main] Saved plot: train_multistep_attenuated.png')
-
-
-
+        print('[main] Saved plot: train_multistep_attenuated_10_norm.png')
 
     #Rollout evaluation
     rollout_start = 0
@@ -193,10 +212,13 @@ def main():
                              rollout_start + input_window + rollout_steps].to(device)
 
     # amplitude-attenuated signals
-    # Only plot the first 400 timesteps to focus on short-term behavior
-    plot_horizon = min(400, X_pred_rollout.shape[0])
+    # Only plot the first 50 timesteps to focus on short-term behavior
+    plot_horizon = min(50, X_pred_rollout.shape[0])
     X_pred_np = X_pred_rollout[..., 0][:plot_horizon].cpu().numpy()
     X_true_np = X_true_rollout[..., 0][:plot_horizon].cpu().numpy()
+    # Denormalize rollout values for plotting
+    X_pred_np = X_pred_np #* norm_std + norm_mean
+    X_true_np = X_true_np #* norm_std + norm_mean
 
     num_plot = 6
     nodes_to_plot = list(range(min(num_plot, N)))
@@ -213,10 +235,10 @@ def main():
             plt.xlabel('Rollout step')
 
     plt.tight_layout()
-    plt.savefig('rollout_attenuated.png', dpi=150)
+    plt.savefig('rollout_attenuated_10_norm.png', dpi=150)
     plt.close()
 
-    print('[main] Saved plot: rollout_attenuated.png')
+    print('[main] Saved plot: rollout_attenuated_10_norm.png')
 
     # (no additional feature-product plots — signals are already attenuated)
 
