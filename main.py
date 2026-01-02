@@ -9,8 +9,8 @@ import matplotlib.pyplot as plt
 
 
 def load_data():
-    signals = np.load("data/full_state.npy", mmap_mode="r")   # (T, N, 3)
-    adjacency = np.load("data/adjacency.npy")                 # (N, N)
+    signals = np.load("data/data/full_state.npy", mmap_mode="r")   # (T, N, 3)
+    adjacency = np.load("data/data/adjacency.npy")                 # (N, N)
     return signals, adjacency
 
 
