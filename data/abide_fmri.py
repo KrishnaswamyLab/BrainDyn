@@ -6,10 +6,6 @@ from tqdm import tqdm
 from nilearn.datasets import fetch_abide_pcp, fetch_atlas_basc_multiscale_2015
 from nilearn.input_data import NiftiLabelsMasker
 
-
-# -----------------------------
-# ABIDE fetching
-# -----------------------------
 def fetch_abide_balanced(data_dir, n_per_group=40):
     """
     Returns nilearn ABIDE dict with:
@@ -40,9 +36,6 @@ def fetch_abide_balanced(data_dir, n_per_group=40):
     )
 
 
-# -----------------------------
-# Time series + adjacency
-# -----------------------------
 def extract_time_series(func_img, labels_img, t_r=2.5):
     """
     Returns ROI time series with shape (T, N).
@@ -107,9 +100,6 @@ def make_full_state(ts_TN):
     return full_state
 
 
-# -----------------------------
-# End-to-end export for main.py
-# -----------------------------
 def export_for_braindyn_main(
     abide_data,
     out_dir="data",
@@ -164,7 +154,6 @@ def export_for_braindyn_main(
     np.save(os.path.join(out_dir, "full_state.npy"), full_state)
     np.save(os.path.join(out_dir, "adjacency.npy"), adj)
 
-    # Optional: save metadata for bookkeeping
     meta = {
         "subject_index": subject_index,
         "SUB_ID": sub_id,
@@ -182,12 +171,10 @@ def export_for_braindyn_main(
 
 
 if __name__ == "__main__":
-    # Point this to wherever you keep ABIDE on your cluster
     data_dir = "/gpfs/gibbs/pi/krishnaswamy_smita/sv496/nilearn_data/ABIDE_pcp/"
 
     abide_data = fetch_abide_balanced(data_dir=data_dir, n_per_group=40)
 
-    # Export ONE subject into ./data/ so your existing main.py runs unchanged.
     export_for_braindyn_main(
         abide_data=abide_data,
         out_dir="data",
