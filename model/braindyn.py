@@ -11,13 +11,13 @@ from .dynamics import BrainDynDynamics
 
 @dataclass
 class BrainDynConfig:
-    signal_dim
-    hidden_dim
-    window_size
-    lstm_layers=1
-    lstm_dropout=0.0
-    map_hidden_dim=128
-    vf_hidden_dim=128
+    signal_dim: int
+    hidden_dim: int
+    window_size: int
+    lstm_layers: int = 1
+    lstm_dropout: float = 0.0
+    map_hidden_dim: int = 128
+    vf_hidden_dim: int = 128
 
 
 class BrainDyn(nn.Module):
@@ -32,7 +32,7 @@ class BrainDyn(nn.Module):
       5. append x_next to history and repeat
     """
 
-    def __init__(self, config):
+    def __init__(self, config) -> None:
         super().__init__()
         self.config = config
 
@@ -48,10 +48,10 @@ class BrainDyn(nn.Module):
 
     def rk4_step(
         self,
-        x_hist,
-        edge_index,
-        dt=1.0,
-    ):
+        x_hist: torch.Tensor,
+        edge_index: torch.Tensor,
+        dt: float | torch.Tensor = 1.0,
+    ) -> tuple[torch.Tensor, dict]:
         """
         One autoregressive RK4 step.
 
@@ -86,12 +86,12 @@ class BrainDyn(nn.Module):
 
     def forward(
         self,
-        x_history,
-        edge_index,
-        pred_steps,
-        dt=1.0,
-        return_aux=False,
-    ):
+        x_history: torch.Tensor,
+        edge_index: torch.Tensor,
+        pred_steps: int,
+        dt: float = 1.0,
+        return_aux: bool = False,
+    ) -> dict[str, Any]:
         """
         x_history: (B, N, T, F)
         edge_index: (2, E)

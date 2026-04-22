@@ -190,8 +190,8 @@ def parse_args():
 
     ap.add_argument("--manifest_csv", type=str, default="data/manifest.csv")
     ap.add_argument("--cohort", type=str, default=None, help="PNC, HBN, or None for both")
-    ap.add_argument("--x", type=int, default=10, help="context length")
-    ap.add_argument("--y", type=int, default=5, help="forecast horizon length")
+    ap.add_argument("--x", type=int, default=30, help="context length")
+    ap.add_argument("--y", type=int, default=10, help="forecast horizon length")
     ap.add_argument("--stride", type=int, default=10)
     ap.add_argument("--min_t", type=int, default=0)
     ap.add_argument("--cache", action="store_true")
