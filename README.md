@@ -34,3 +34,6 @@ python kuramoto_brain_multirhythm.py
 ```bash
 python main.py
 ```
+
+The sheaf node features are learned from each node's recent signal window with an LSTM history encoder.
+You can configure it with environment variables: `SHEAF_LSTM_HIDDEN_DIM` (default `64`), `SHEAF_LSTM_NUM_LAYERS` (default `1`), and `SHEAF_LSTM_DROPOUT` (default `0.0`).

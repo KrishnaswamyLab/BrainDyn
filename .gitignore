@@ -4,3 +4,4 @@ logs/
 plots/
 *.png
 *.npz
+__pycache__/
