@@ -5,3 +5,6 @@ plots/
 *.png
 *.npz
 __pycache__/
+checkpoints/
+outputs/
+*.csv
