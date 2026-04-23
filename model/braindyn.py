@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torchdiffeq import odeint
 
 from .dynamics import BrainDynDynamics
 
@@ -18,23 +19,29 @@ class BrainDynConfig:
     lstm_dropout: float = 0.0
     map_hidden_dim: int = 128
     vf_hidden_dim: int = 128
+    ode_method: str = "rk4"
 
 
 class BrainDyn(nn.Module):
     """
-    Autoregressive BrainDyn with RK4 stepping.
+    BrainDyn with ODE solver stepping.
 
-    At each forecast step:
-      1. encode current history
-      2. compute spatial attention + restriction maps + sheaf Laplacian
-      3. compute dx/dt
-      4. use RK4 to get x_next
-      5. append x_next to history and repeat
+    Per forward call, integrates over the full requested horizon from
+    a fixed context window. Longer rollouts are handled outside this
+    module by feeding predicted chunks back into context.
     """
 
     def __init__(self, config) -> None:
         super().__init__()
         self.config = config
+        self.ode_method = getattr(config, "ode_method", "rk4")
+
+        valid_methods = {"rk4", "dopri5", "euler", "midpoint"}
+        if self.ode_method not in valid_methods:
+            raise ValueError(
+                f"Unsupported ode_method='{self.ode_method}'. "
+                f"Choose one of: {sorted(valid_methods)}"
+            )
 
         self.dynamics = BrainDynDynamics(
             signal_dim=config.signal_dim,
@@ -46,50 +53,13 @@ class BrainDyn(nn.Module):
             vf_hidden_dim=config.vf_hidden_dim,
         )
 
-    def rk4_step(
-        self,
-        x_hist: torch.Tensor,
-        edge_index: torch.Tensor,
-        dt: float | torch.Tensor = 1.0,
-    ) -> tuple[torch.Tensor, dict]:
-        """
-        One autoregressive RK4 step.
-
-        x_hist: (B, N, T, F)
-        returns:
-            x_next: (B, N, F)
-            aux: dict from k1 computation
-        """
-        if not torch.is_tensor(dt):
-            dt = torch.tensor(dt, dtype=x_hist.dtype, device=x_hist.device)
-
-        x_t = x_hist[:, :, -1, :]  # (B, N, F)
-
-        # k1
-        k1, aux1 = self.dynamics(x_hist, edge_index, x_eval=x_t)
-
-        # k2
-        x_mid1 = x_t + 0.5 * dt * k1
-        k2, _ = self.dynamics(x_hist, edge_index, x_eval=x_mid1)
-
-        # k3
-        x_mid2 = x_t + 0.5 * dt * k2
-        k3, _ = self.dynamics(x_hist, edge_index, x_eval=x_mid2)
-
-        # k4
-        x_end = x_t + dt * k3
-        k4, _ = self.dynamics(x_hist, edge_index, x_eval=x_end)
-
-        x_next = x_t + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-
-        return x_next, aux1
-
     def forward(
         self,
         x_history: torch.Tensor,
         edge_index: torch.Tensor,
         pred_steps: int,
         dt: float = 1.0,
+        autoregressive: bool = False,
         return_aux: bool = False,
     ) -> dict[str, Any]:
         """
@@ -104,23 +74,29 @@ class BrainDyn(nn.Module):
                 "aux_seq": optional list of dicts
             }
         """
-        hist = x_history
-        preds = []
-        aux_seq = []
+        if pred_steps <= 0:
+            raise ValueError(f"pred_steps must be positive, got {pred_steps}")
 
-        for _ in range(pred_steps):
-            x_next, aux = self.rk4_step(hist, edge_index, dt=dt)
-            preds.append(x_next)
+        # Keep the argument for backward compatibility; rollout strategy
+        # is controlled by the caller by feeding predicted chunks back.
+        _ = autoregressive
 
-            if return_aux:
-                aux_seq.append(aux)
+        dt_t = dt if torch.is_tensor(dt) else torch.tensor(dt, dtype=x_history.dtype, device=x_history.device)
+        x0 = x_history[:, :, -1, :]
 
-            # roll history window
-            hist = torch.cat([hist[:, :, 1:, :], x_next.unsqueeze(2)], dim=2)
+        def rhs(_t: torch.Tensor, x_eval: torch.Tensor) -> torch.Tensor:
+            dxdt, _ = self.dynamics(x_history, edge_index, x_eval=x_eval)
+            return dxdt
 
-        x_pred = torch.stack(preds, dim=0)
+        t_eval = torch.arange(pred_steps + 1, device=x_history.device, dtype=x_history.dtype) * dt_t.to(dtype=x_history.dtype)
+        x_traj = odeint(rhs, x0, t_eval, method=self.ode_method)
+        x_pred = x_traj[1:]
 
         out = {"x_pred": x_pred}
         if return_aux:
+            aux_seq = []
+            for step_state in x_pred:
+                _, aux = self.dynamics(x_history, edge_index, x_eval=step_state)
+                aux_seq.append(aux)
             out["aux_seq"] = aux_seq
         return out
