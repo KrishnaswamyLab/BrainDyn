@@ -481,9 +481,17 @@ def main():
         )
 
     cohort_tag = (args.cohort or "all").lower()
+    forecast_tag = args.forecast_mode
+    ablation_parts = []
+    if args.ablation_gat:
+        ablation_parts.append("ablation_gat")
+    if args.ablation_no_lstm:
+        ablation_parts.append("ablation_no_lstm")
+    ablation_tag = "main" if len(ablation_parts) == 0 else "_".join(ablation_parts)
+
     default_save_path = "checkpoints/braindyn_rbc_best.pt"
     resolved_save_path = (
-        f"checkpoints/braindyn_rbc_{cohort_tag}_best.pt"
+        f"checkpoints/braindyn_rbc_{cohort_tag}_{forecast_tag}_{ablation_tag}_best.pt"
         if args.save_path == default_save_path
         else args.save_path
     )
