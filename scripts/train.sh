@@ -12,4 +12,4 @@
 module load uv
 source .venv/bin/activate
 
-uv run main.py --cohort PNC --amp --no_pin_memory --lr 3e-4 --lr_patience 2 --lr_factor 0.5 --lr_min 1e-6
+uv run main.py --cohort PNC --amp --no_pin_memory --lr 1e-3 --lr_patience 3 --lr_factor 0.5 --lr_min 1e-6

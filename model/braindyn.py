@@ -14,12 +14,15 @@ from .dynamics import BrainDynDynamics
 class BrainDynConfig:
     signal_dim: int
     hidden_dim: int
+    num_nodes: int
     window_size: int
     lstm_layers: int = 1
     lstm_dropout: float = 0.0
-    map_hidden_dim: int = 128
+    map_hidden_dim: int = 16
     vf_hidden_dim: int = 128
     ode_method: str = "rk4"
+    use_gat: bool = False
+    use_lstm_encoder: bool = True
 
 
 class BrainDyn(nn.Module):
@@ -46,11 +49,14 @@ class BrainDyn(nn.Module):
         self.dynamics = BrainDynDynamics(
             signal_dim=config.signal_dim,
             hidden_dim=config.hidden_dim,
+            num_nodes=config.num_nodes,
             window_size=config.window_size,
             lstm_layers=config.lstm_layers,
             lstm_dropout=config.lstm_dropout,
             map_hidden_dim=config.map_hidden_dim,
             vf_hidden_dim=config.vf_hidden_dim,
+            use_gat=config.use_gat,
+            use_lstm_encoder=config.use_lstm_encoder,
         )
 
     def forward(

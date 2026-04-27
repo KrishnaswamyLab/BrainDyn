@@ -20,6 +20,7 @@ class BrainDynODEFunc(nn.Module):
         self,
         signal_dim,
         hidden_dim,
+        num_nodes,
         window_size,
         lstm_layers=1,
         lstm_dropout=0.0,
@@ -39,6 +40,7 @@ class BrainDynODEFunc(nn.Module):
         )
         self.sheaf_laplacian = SheafLaplacian(
             hidden_dim=hidden_dim,
+            num_nodes=num_nodes,
             map_hidden_dim=map_hidden_dim,
         )
 

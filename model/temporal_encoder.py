@@ -6,7 +6,7 @@ import torch.nn as nn
 
 class TemporalEncoder(nn.Module):
     """
-    LSTM + temporal attention.
+    LSTM encoder.
 
     Input:
         x_hist: (B, N, T, F)
@@ -35,22 +35,6 @@ class TemporalEncoder(nn.Module):
             dropout=lstm_dropout,
         )
 
-        self.theta_t = nn.Linear(2 * hidden_dim, hidden_dim)
-        self.a_t = nn.Parameter(torch.randn(hidden_dim))
-
-    def temporal_score(self, current, history):
-        """
-        current: (B, N, H)
-        history: (B, N, T, H)
-        returns: (B, N, T)
-        """
-        T = history.shape[2]
-        current_exp = current.unsqueeze(2).expand(-1, -1, T, -1)
-        cat = torch.cat([current_exp, history], dim=-1)
-        z = torch.tanh(self.theta_t(cat))
-        scores = torch.einsum("bnth,h->bnt", z, self.a_t)
-        return scores
-
     def forward(self, x_hist):
         """
         x_hist: (B, N, T, F)
@@ -67,9 +51,5 @@ class TemporalEncoder(nn.Module):
         z_seq, _ = self.lstm(x_flat)
         z_seq = z_seq.reshape(B, N, T, self.hidden_dim)
 
-        current = z_seq[:, :, -1, :]
-        scores = self.temporal_score(current, z_seq)
-        gamma = torch.softmax(scores, dim=-1)
-
-        h = torch.einsum("bnt,bnth->bnh", gamma, z_seq)
+        h = z_seq[:, :, -1, :]
         return h

@@ -3,61 +3,45 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .attention import SpatialAttention
-
-
-class RestrictionMapGenerator(nn.Module):
-    """
-    Generates Phi_{v->e}(t) in R^{H x H}.
-    """
-
-    def __init__(self, hidden_dim, map_hidden_dim=128) -> None:
-        super().__init__()
-        self.hidden_dim = hidden_dim
-
-        self.map_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_dim, map_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(map_hidden_dim, map_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(map_hidden_dim, hidden_dim * hidden_dim),
-        )
-
-    def forward(self, h_src, h_dst):
-        """
-        h_src: (B, E, H)
-        h_dst: (B, E, H)
-        returns: (B, E, H, H)
-        """
-        B, E, H = h_src.shape
-        out = self.map_mlp(torch.cat([h_src, h_dst], dim=-1))
-        return out.view(B, E, H, H)
+try:
+    from torch_geometric.nn import GATConv
+except ImportError:  # pragma: no cover - runtime guard for optional dependency
+    GATConv = None
 
 
 class SheafLaplacian(nn.Module):
     """
     (L_F h)_v = sum_{u in N_v} rho_{v->e}^T (tilde{h}_{v->e} - tilde{h}_{u->e})
-
-    with rho_{v->e}(t) = alpha_{vu}(t) * Phi_{v->e}(t)
     """
 
-    def __init__(self, hidden_dim, map_hidden_dim=128):
+    def __init__(self, hidden_dim, num_nodes, map_hidden_dim=128):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.spatial_attention = SpatialAttention(hidden_dim)
-        self.restriction_map = RestrictionMapGenerator(hidden_dim, map_hidden_dim)
+        self.num_nodes = num_nodes
+        self.src_weight_logit = nn.Parameter(torch.tensor(0.0))
+        self.dst_weight_logit = nn.Parameter(torch.tensor(0.0))
+        self.restriction_maps = nn.Parameter(torch.empty(num_nodes, hidden_dim, map_hidden_dim))
+        nn.init.xavier_uniform_(self.restriction_maps)
+
+    @staticmethod
+    def _minmax_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        x_min = x.amin(dim=-1, keepdim=True)
+        x_max = x.amax(dim=-1, keepdim=True)
+        return (x - x_min) / (x_max - x_min + eps)
 
     def forward(self, h, edge_index):
         """
-        h: (B, N, H)
+        h: (B, N, D)
         edge_index: (2, E)
 
         returns:
-            lap: (B, N, H)
+            lap: (B, N, D)
             aux: dict
         """
         if h.ndim != 3:
-            raise ValueError(f"h must have shape (B, N, H), got {tuple(h.shape)}")
+            raise ValueError(f"h must have shape (B, N, D), got {tuple(h.shape)}")
+        if h.shape[1] != self.num_nodes:
+            raise ValueError(f"Expected {self.num_nodes} nodes, got {h.shape[1]}")
 
         src = edge_index[0]
         dst = edge_index[1]
@@ -65,35 +49,93 @@ class SheafLaplacian(nn.Module):
         h_src = h[:, src, :]
         h_dst = h[:, dst, :]
 
-        alpha = self.spatial_attention(h, edge_index)   # (B, E)
+        Phi_src = self.restriction_maps[src]
+        Phi_dst = self.restriction_maps[dst]
 
-        Phi_src = self.restriction_map(h_src, h_dst)    # (B, E, H, H)
-        Phi_dst = self.restriction_map(h_dst, h_src)    # (B, E, H, H)
+        rho_src = Phi_src
+        rho_dst = Phi_dst
 
-        rho_src = alpha.unsqueeze(-1).unsqueeze(-1) * Phi_src
-        rho_dst = alpha.unsqueeze(-1).unsqueeze(-1) * Phi_dst
+        tilde_src = torch.einsum("bed,edh->beh", h_src, rho_src)
+        tilde_dst = torch.einsum("bed,edh->beh", h_dst, rho_dst)
 
-        tilde_src = torch.einsum("beij,bej->bei", rho_src, h_src)
-        tilde_dst = torch.einsum("beij,bej->bei", rho_dst, h_dst)
+        tilde_src_norm = self._minmax_normalize(tilde_src)
+        tilde_dst_norm = self._minmax_normalize(tilde_dst)
 
-        delta = tilde_dst - tilde_src
-        pulled_back = torch.einsum("beji,bej->bei", rho_dst, delta)
+        src_weight = torch.sigmoid(self.src_weight_logit)
+        dst_weight = torch.sigmoid(self.dst_weight_logit)
 
-        B, N, H = h.shape
+        delta = dst_weight * tilde_dst_norm - src_weight * tilde_src_norm
+        msg_src = torch.einsum("beh,edh->bed", -delta, rho_src)
+        msg_dst = torch.einsum("beh,edh->bed", delta, rho_dst)
+        # pulled_back = torch.einsum("beji,bej->bei", rho_dst, delta)
+
+        B, N, D = h.shape
         lap = torch.zeros_like(h)
-        # vectorised scatter over batch dimension: (B, E, H) -> (B, N, H)
-        lap.scatter_add_(
-            1,
-            dst.unsqueeze(0).unsqueeze(-1).expand(B, -1, H),
-            pulled_back,
-        )
+        lap.index_add_(1, src, msg_src)
+        lap.index_add_(1, dst, msg_dst)
+        # # vectorised scatter over batch dimension: (B, E, D) -> (B, N, D)
+        # lap.scatter_add_(
+        #     1,
+        #     dst.unsqueeze(0).unsqueeze(-1).expand(B, -1, D),
+        #     pulled_back,
+        # )
 
         aux = {
-            "alpha": alpha,
+            "src_weight": src_weight,
+            "dst_weight": dst_weight,
             "rho_src": rho_src,
             "rho_dst": rho_dst,
             "tilde_src": tilde_src,
             "tilde_dst": tilde_dst,
+            "tilde_src_norm": tilde_src_norm,
+            "tilde_dst_norm": tilde_dst_norm,
             "delta": delta,
         }
         return lap, aux
+
+
+class GATAggregator(nn.Module):
+    """GAT neighborhood aggregation implemented with PyG GATConv."""
+
+    def __init__(self, hidden_dim: int, num_nodes: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_nodes = num_nodes
+        if GATConv is None:
+            raise ImportError(
+                "GAT ablation requires torch-geometric. Install it with: pip install torch-geometric"
+            )
+        self.gat = GATConv(
+            in_channels=hidden_dim,
+            out_channels=hidden_dim,
+            heads=1,
+            concat=False,
+            add_self_loops=False,
+            dropout=0.0,
+            bias=True,
+        )
+
+    def forward(self, h: torch.Tensor, edge_index: torch.Tensor):
+        """
+        h: (B, N, D)
+        edge_index: (2, E)
+        returns:
+            agg: (B, N, D)
+            aux: dict
+        """
+        if h.ndim != 3:
+            raise ValueError(f"h must have shape (B, N, D), got {tuple(h.shape)}")
+        if h.shape[1] != self.num_nodes:
+            raise ValueError(f"Expected {self.num_nodes} nodes, got {h.shape[1]}")
+
+        batch_outputs = []
+        for b in range(h.shape[0]):
+            # PyG GATConv expects node features of shape (N, D) per graph.
+            out_b = self.gat(h[b], edge_index)
+            batch_outputs.append(out_b)
+        agg = torch.stack(batch_outputs, dim=0)
+
+        aux = {
+            "graph_mode": "gat",
+        }
+        return agg, aux
