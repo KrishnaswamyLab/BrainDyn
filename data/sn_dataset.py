@@ -283,7 +283,7 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(description="Unit tests for SNDataset.")
     ap.add_argument("npz_path", nargs="?", default=str(DATA_NPZ_PATH))
-    ap.add_argument("--x", type=int, default=40)
+    ap.add_argument("--x", type=int, default=90)
     ap.add_argument("--y", type=int, default=30)
     ap.add_argument("--stride", type=int, default=5)
     ap.add_argument("--batch-size", type=int, default=8)
