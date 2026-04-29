@@ -1066,7 +1066,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--neuron-model", type=str, default="iaf_psc_alpha")
     p.add_argument("--resolution-ms", type=float, default=0.1)
     p.add_argument("--threads", type=int, default=1)
-    p.add_argument("--simulation-time-ms", type=float, default=5000.0)
+    p.add_argument("--simulation-time-ms", type=float, default=2000.0)
     p.add_argument("--synapse-weight", type=float, default=1.0)
     p.add_argument("--synapse-delay-ms", type=float, default=1.5)
     p.add_argument("--use-graph-weights", action="store_true")
