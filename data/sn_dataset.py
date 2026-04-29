@@ -122,7 +122,7 @@ class SNDataset(Dataset):
         self._pert_start = np.asarray(self._npz["perturbation_start_ms"], dtype=np.float64)
         self._pert_end = np.asarray(self._npz["perturbation_end_ms"], dtype=np.float64)
         self._pert_n = np.asarray(self._npz["perturbation_n_nodes"], dtype=np.int64)
-        self._pert_nodes_pad = np.asarray(self._npz["perturbation_nodes_padded"], dtype=np.int64)
+        self._pert_nodes = np.asarray(self._npz["perturbation_nodes"], dtype=np.int64)
         self._graph_seeds = np.asarray(self._npz["graph_seeds"], dtype=np.int64)
 
         run_cfg = _read_run_config(path)
@@ -202,7 +202,7 @@ class SNDataset(Dataset):
             pert = self._rates_pert_tc(s)
             o_t, p_t = _zscore_pair_from_reference(orig, pert)
             kn = int(self._pert_n[s])
-            pad = torch.from_numpy(self._pert_nodes_pad[s].astype(np.int64).copy())
+            nodes = torch.from_numpy(self._pert_nodes[s].astype(np.int64).copy())
             mode = self._perturbation_mode or ""
             meta = {
                 "subject_index": int(s),
@@ -213,15 +213,10 @@ class SNDataset(Dataset):
                 "perturbation_start_ms": float(self._pert_start[s]),
                 "perturbation_end_ms": float(self._pert_end[s]),
                 "perturbation_mode": mode,
+                "perturbed_n_nodes": torch.tensor(kn, dtype=torch.long),
+                "perturbed_nodes": nodes,
             }
-            import pdb; pdb.set_trace()
-            return {
-                "x_original": o_t,
-                "x_perturbed": p_t,
-                "pert_n_nodes": torch.tensor(kn, dtype=torch.long),
-                "pert_nodes_pad": pad,
-                "meta": meta,
-            }
+            return {"x_original": o_t, "x_perturbed": p_t, "meta": meta}
 
     def summary(self) -> str:
         return (
