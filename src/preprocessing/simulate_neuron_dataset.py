@@ -919,8 +919,7 @@ def simulate_bulk_neuron_dataset(
     pert_start_ms = np.zeros(num_simulations, dtype=np.float64)
     pert_end_ms = np.zeros(num_simulations, dtype=np.float64)
     pert_n_nodes = np.zeros(num_simulations, dtype=np.int8)
-    max_k = min(7, n_nodes)
-    pert_nodes_pad = np.full((num_simulations, max_k), -1, dtype=np.int64)
+    pert_nodes = np.full((num_simulations, 1), -1, dtype=np.int64)
 
     bin_edges_ms: np.ndarray | None = None
     check_panels_path: str | None = None
@@ -954,7 +953,7 @@ def simulate_bulk_neuron_dataset(
         pert_end_ms[s] = spec.end_ms
         kn = len(spec.nodes)
         pert_n_nodes[s] = kn
-        pert_nodes_pad[s, :kn] = np.asarray(spec.nodes, dtype=np.int64)
+        pert_nodes[s, :kn] = np.asarray(spec.nodes, dtype=np.int64)
 
         if s == 0:
             be = bin_edges_ms
@@ -981,7 +980,7 @@ def simulate_bulk_neuron_dataset(
         "perturbation_start_ms": pert_start_ms,
         "perturbation_end_ms": pert_end_ms,
         "perturbation_n_nodes": pert_n_nodes,
-        "perturbation_nodes_padded": pert_nodes_pad,
+        "perturbation_nodes": pert_nodes,
     }
 
     npz_path = save_bulk_dataset_npz(arrays)

@@ -196,30 +196,32 @@ class SNDataset(Dataset):
             }
             return {"x": x_t, "y": y_t, "meta": meta}
 
-        (s,) = self._index[idx]
-        orig = self._rates_orig_tc(s)
-        pert = self._rates_pert_tc(s)
-        o_t, p_t = _zscore_pair_from_reference(orig, pert)
-        kn = int(self._pert_n[s])
-        pad = torch.from_numpy(self._pert_nodes_pad[s].astype(np.int64).copy())
-        mode = self._perturbation_mode or ""
-        meta = {
-            "subject_index": int(s),
-            "graph_seed": int(self._graph_seeds[s]),
-            "split": self.split,
-            "T": self.n_bins,
-            "n_channels": self.n_channels,
-            "perturbation_start_ms": float(self._pert_start[s]),
-            "perturbation_end_ms": float(self._pert_end[s]),
-            "perturbation_mode": mode,
-        }
-        return {
-            "rates_original": o_t,
-            "rates_perturbed": p_t,
-            "pert_n_nodes": torch.tensor(kn, dtype=torch.long),
-            "pert_nodes_pad": pad,
-            "meta": meta,
-        }
+        else:
+            (s,) = self._index[idx]
+            orig = self._rates_orig_tc(s)
+            pert = self._rates_pert_tc(s)
+            o_t, p_t = _zscore_pair_from_reference(orig, pert)
+            kn = int(self._pert_n[s])
+            pad = torch.from_numpy(self._pert_nodes_pad[s].astype(np.int64).copy())
+            mode = self._perturbation_mode or ""
+            meta = {
+                "subject_index": int(s),
+                "graph_seed": int(self._graph_seeds[s]),
+                "split": self.split,
+                "T": self.n_bins,
+                "n_channels": self.n_channels,
+                "perturbation_start_ms": float(self._pert_start[s]),
+                "perturbation_end_ms": float(self._pert_end[s]),
+                "perturbation_mode": mode,
+            }
+            import pdb; pdb.set_trace()
+            return {
+                "x_original": o_t,
+                "x_perturbed": p_t,
+                "pert_n_nodes": torch.tensor(kn, dtype=torch.long),
+                "pert_nodes_pad": pad,
+                "meta": meta,
+            }
 
     def summary(self) -> str:
         return (
@@ -320,8 +322,8 @@ if __name__ == "__main__":
                         )
                     else:
                         print(
-                            f"{name}: rates_original={tuple(batch['rates_original'].shape)} "
-                            f"{name}: rates_perturbed={tuple(batch['rates_perturbed'].shape)} "
+                            f"{name}: x_original={tuple(batch['x_original'].shape)} "
+                            f"{name}: x_perturbed={tuple(batch['x_perturbed'].shape)} "
                             f"metadata={batch['meta']}"
                         )
                 if i + 1 >= args.n_batches:
