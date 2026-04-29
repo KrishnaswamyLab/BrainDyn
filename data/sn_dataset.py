@@ -214,7 +214,6 @@ class SNDataset(Dataset):
                 "perturbation_end_ms": float(self._pert_end[s]),
                 "perturbation_mode": mode,
             }
-            import pdb; pdb.set_trace()
             return {
                 "x_original": o_t,
                 "x_perturbed": p_t,
