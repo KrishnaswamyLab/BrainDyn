@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --job-name=braindyn_long_ablgat
-#SBATCH --time=20:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --partition=gpu
 #SBATCH --qos=qos_nmi --gres=gpu:h200:1
@@ -22,7 +22,7 @@ uv run main.py \
   --x 30 \
   --y 10 \
   --forecast_mode long \
-  --ar_chunk_size 5 \
+  --ar_chunk_size 10 \
   --ablation_gat \
   --amp \
   --no_pin_memory \

@@ -22,7 +22,7 @@ uv run main.py \
   --x 30 \
   --y 10 \
   --forecast_mode long \
-  --ar_chunk_size 5 \
+  --ar_chunk_size 10 \
   --amp \
   --no_pin_memory \
   --lr 1e-3 \
