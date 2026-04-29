@@ -1,13 +1,9 @@
-"""
-Self-contained script: NEST neuron-graph dataset (one node = one neuron), saved arrays,
-and sanity-check figures.
+"""Generate simulated neuron-graph trajectories and save paired rate datasets.
 
-``dataset.npz`` is written under ``{ROOT_DIR}/data/simulated_neuron_dataset/``
-(``run_config.json`` alongside). Quick-look figures for **subject 0 only** go under
-``src/preprocessing/check_simulated_neuron_dataset/`` (``config.json``,
-``smoothed_sample_panels.png`` with original solid / perturbed dashed, ``graph_structure.png``).
-
-Requires: Python env with ``numpy``, ``matplotlib``, and ``nest`` installed.
+Outputs:
+- ``data/simulated_neuron_dataset/dataset.npz``
+- ``data/simulated_neuron_dataset/run_config.json``
+- Subject-0 check artifacts in ``src/preprocessing/check_simulated_neuron_dataset/``
 """
 from __future__ import annotations
 
@@ -22,7 +18,6 @@ import nest
 import numpy as np
 from tqdm import tqdm
 
-# BrainDyn/ — three path segments above this file (src/preprocessing/simulate_neuron_dataset.py)
 ROOT_DIR = os.path.normpath("/".join(os.path.realpath(__file__).split(os.sep)[:-3]))
 SIMULATED_NEURON_DATA_DIR = os.path.join(ROOT_DIR, "data", "simulated_neuron_dataset")
 CHECK_SIMULATED_NEURON_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "check_simulated_neuron_dataset")
@@ -85,18 +80,11 @@ class ProcessingConfig:
 
 
 @dataclass
-class SaveConfig:
-    save_npz: bool = True
-    save_csv: bool = True
-
-
-@dataclass
 class FullConfig:
     mode: str = "neuron"
     graph: GraphConfig = field(default_factory=GraphConfig)
     nest: NestConfig = field(default_factory=NestConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
-    save: SaveConfig = field(default_factory=SaveConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -405,25 +393,14 @@ def counts_to_smoothed_rates_hz(counts: np.ndarray, processing: ProcessingConfig
 
 
 # ---------------------------------------------------------------------------
-# Save outputs (``os`` paths only)
+# Save output artifacts
 # ---------------------------------------------------------------------------
 
-
-def _save_spikes_csv(path: str, senders: np.ndarray, times_ms: np.ndarray) -> None:
-    arr = np.column_stack([senders, times_ms])
-    np.savetxt(path, arr, delimiter=",", header="sender,time_ms", comments="", fmt=["%d", "%.6f"])
-
-
-def _save_matrix_csv(path: str, matrix: np.ndarray) -> None:
-    np.savetxt(path, matrix, delimiter=",")
-
-
-def save_bulk_dataset_npz(arrays: dict[str, Any], save_npz: bool) -> str:
-    """Write ``dataset.npz`` under ``SIMULATED_NEURON_DATA_DIR`` only."""
+def save_bulk_dataset_npz(arrays: dict[str, Any]) -> str:
+    """Write ``dataset.npz`` under ``SIMULATED_NEURON_DATA_DIR``."""
     os.makedirs(SIMULATED_NEURON_DATA_DIR, exist_ok=True)
     path = os.path.join(SIMULATED_NEURON_DATA_DIR, "dataset.npz")
-    if save_npz:
-        np.savez_compressed(path, **arrays)
+    np.savez_compressed(path, **arrays)
     return path
 
 
@@ -566,14 +543,10 @@ def nest_simulation_raw_counts(cfg: FullConfig) -> dict[str, Any]:
 def run_paired_smoothed_rates_hz(
     cfg: FullConfig, spec: PerturbationSpec, mode: str
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Original vs perturbed smoothed rates (Hz), plus shared ``bin_edges_ms``.
+    """Return original/perturbed smoothed rates and shared bin edges.
 
-    ``mute_bins`` / ``scale_bins``: one NEST run, same spike counts; perturbed branch applies
-    post-hoc count edits (paired trajectories).
-
-    ``extra_poisson``: two NEST runs (baseline vs extra drive); trajectories are not
-    spike-identical but both use the same graph seed and drive settings.
+    ``mute_bins`` and ``scale_bins`` apply perturbations to counts from one baseline run.
+    ``extra_poisson`` runs baseline and perturbed simulations separately.
     """
     if mode in ("mute_bins", "scale_bins"):
         cfg0 = replace(cfg, nest=replace(cfg.nest, perturbations=[]))
@@ -636,11 +609,8 @@ def _graph_title_from_config(config_dir: Optional[str]) -> str:
     with open(cfg_path, encoding="utf-8") as f:
         c = json.load(f)
     g = c.get("graph", {})
-    mode = c.get("mode", "neuron")
     rule = g.get("graph_rule", "?")
     n = g.get("n_nodes", "?")
-    if mode == "population":
-        return f"Population graph ({rule}, n={n})"
     if rule == "knn":
         return f"Neuron graph ({rule}, k={g.get('k', '?')}, n={n})"
     return f"Neuron graph ({rule}, n={n})"
@@ -661,138 +631,6 @@ def _central_time_slice(n_bins: int, center_fraction: float) -> slice:
     if b <= a:
         return slice(0, n_bins)
     return slice(a, b)
-
-
-def _smoothed_sample_data(
-    output: str | dict[str, np.ndarray],
-    n_nodes: int,
-    seed: Optional[int],
-    center_fraction: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, slice]:
-    arrays = _load_dataset_arrays(output)
-    if "smoothed_rates_hz" not in arrays:
-        raise KeyError("smoothed_rates_hz not in dataset")
-    rates_full = np.asarray(arrays["smoothed_rates_hz"], dtype=np.float64)
-    n_units, n_bins = rates_full.shape
-    if n_nodes > n_units:
-        raise ValueError(f"n_nodes ({n_nodes}) cannot exceed number of units ({n_units})")
-
-    rng = np.random.default_rng(seed)
-    node_indices = rng.choice(n_units, size=n_nodes, replace=False)
-    node_indices = np.sort(node_indices)
-
-    if "bin_edges_ms" in arrays:
-        t_full = _bin_centers_ms(np.asarray(arrays["bin_edges_ms"], dtype=np.float64))
-    else:
-        t_full = np.arange(n_bins, dtype=np.float64)
-    if t_full.shape[0] != n_bins:
-        raise ValueError(
-            f"Time axis length {t_full.shape[0]} != number of rate bins {n_bins}"
-        )
-
-    s = _central_time_slice(n_bins, center_fraction)
-    t_ms = t_full[s]
-    rates = rates_full[node_indices, :][:, s]
-    return t_ms, rates, node_indices, s
-
-
-def _plot_smoothed_rates_overlaid(
-    output: str | dict[str, np.ndarray],
-    n_nodes: int = 5,
-    seed: Optional[int] = None,
-    center_fraction: float = 0.5,
-    figsize: Optional[Tuple[float, float]] = None,
-) -> Tuple[Any, Any]:
-    t_ms, rates, node_indices, _s = _smoothed_sample_data(
-        output, n_nodes, seed, center_fraction
-    )
-    n_t = t_ms.shape[0]
-    if n_t < 1:
-        raise ValueError("No time bins in selected range (empty slice).")
-    if figsize is None:
-        figsize = (10.0, 4.0)
-
-    fig, ax = plt.subplots(figsize=figsize)
-    for i, idx in enumerate(node_indices):
-        ax.plot(
-            t_ms, rates[i], color=f"C{i % 10}", label=f"node {int(idx)}", alpha=0.9, linewidth=1.0
-        )
-    ax.set_xlabel("Time (ms)")
-    ax.set_ylabel("Smoothed rate (Hz)")
-    ax.set_title("Smoothed rate")
-    ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    return fig, ax
-
-
-def _plot_smoothed_rates_panels(
-    output: str | dict[str, np.ndarray],
-    n_nodes: int = 5,
-    seed: Optional[int] = None,
-    center_fraction: float = 0.5,
-    figsize: Optional[Tuple[float, float]] = None,
-) -> Tuple[Any, Any]:
-    t_ms, rates, node_indices, _s = _smoothed_sample_data(
-        output, n_nodes, seed, center_fraction
-    )
-    n_t = t_ms.shape[0]
-    if n_t < 1:
-        raise ValueError("No time bins in selected range (empty slice).")
-    if figsize is None:
-        figsize = (10.0, 2.4 * n_nodes + 0.3)
-
-    fig, axs = plt.subplots(n_nodes, 1, sharex=True, sharey=False, figsize=figsize)
-    if n_nodes == 1:
-        ax_list = [axs]
-    else:
-        ax_list = [axs[i] for i in range(n_nodes)]
-
-    for i, (ax, idx) in enumerate(zip(ax_list, node_indices)):
-        ax.plot(t_ms, rates[i], color=f"C{i % 10}", alpha=0.9)
-        ax.set_ylabel("Smoothed rate (Hz)", fontsize=9)
-        ax.set_title(f"Node {int(idx)}", fontsize=10)
-    ax_list[-1].set_xlabel("Time (ms)")
-    fig.suptitle("Smoothed rate — separate panels (middle 50% of timeline)", y=0.999, fontsize=10)
-    fig.tight_layout(rect=(0, 0, 1, 0.99))
-    return fig, axs
-
-
-def _write_smoothed_sample_plots(
-    output: str | dict[str, np.ndarray],
-    output_dir: str,
-    n_nodes: int = 5,
-    seed: Optional[int] = None,
-    center_fraction: float = 0.5,
-    figsize: Optional[Tuple[float, float]] = None,
-    dpi: int = 120,
-    overlaid_name: str = "smoothed_sample_overlaid.png",
-    panels_name: str = "smoothed_sample_panels.png",
-) -> Tuple[str, str]:
-    os.makedirs(output_dir, exist_ok=True)
-    p_over = os.path.join(output_dir, overlaid_name)
-    p_pan = os.path.join(output_dir, panels_name)
-
-    fig_o, _axo = _plot_smoothed_rates_overlaid(
-        output,
-        n_nodes=n_nodes,
-        seed=seed,
-        center_fraction=center_fraction,
-        figsize=figsize,
-    )
-    fig_o.savefig(p_over, dpi=dpi, bbox_inches="tight")
-    plt.close(fig_o)
-
-    fig_p, _axp = _plot_smoothed_rates_panels(
-        output,
-        n_nodes=n_nodes,
-        seed=seed,
-        center_fraction=center_fraction,
-        figsize=figsize,
-    )
-    fig_p.savefig(p_pan, dpi=dpi, bbox_inches="tight")
-    plt.close(fig_p)
-
-    return p_over, p_pan
 
 
 def write_check_original_vs_perturbed_panels(
@@ -1066,11 +904,7 @@ def simulate_bulk_neuron_dataset(
     perturbation_mode: str,
     seed: int,
 ) -> dict[str, Any]:
-    """
-    Run ``num_simulations`` independent graphs (subject ``s`` uses graph seed ``seed + s``).
-    Perturbation targets and window are drawn from a separate RNG stream per subject so they differ
-    while staying in a visible-but-local band of time and a modest subset of neurons.
-    """
+    """Simulate many subjects and persist paired original/perturbed rate arrays."""
     if perturbation_mode not in PERTURBATION_MODES:
         raise ValueError(f"perturbation_mode must be one of {sorted(PERTURBATION_MODES)}")
     if num_simulations < 1:
@@ -1150,7 +984,7 @@ def simulate_bulk_neuron_dataset(
         "perturbation_nodes_padded": pert_nodes_pad,
     }
 
-    npz_path = save_bulk_dataset_npz(arrays, base_cfg.save.save_npz)
+    npz_path = save_bulk_dataset_npz(arrays)
 
     run_meta: dict[str, Any] = {
         "base_config": base_cfg.to_dict(),
@@ -1205,11 +1039,7 @@ def _full_config_from_args(args: argparse.Namespace) -> FullConfig:
         bin_size_ms=args.bin_size_ms,
         smoothing_sigma_ms=args.smoothing_sigma_ms,
     )
-    save = SaveConfig(
-        save_npz=not args.no_npz,
-        save_csv=not args.no_csv,
-    )
-    return FullConfig(mode="neuron", graph=graph, nest=nest_cfg, processing=processing, save=save)
+    return FullConfig(mode="neuron", graph=graph, nest=nest_cfg, processing=processing)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1236,7 +1066,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--neuron-model", type=str, default="iaf_psc_alpha")
     p.add_argument("--resolution-ms", type=float, default=0.1)
     p.add_argument("--threads", type=int, default=1)
-    p.add_argument("--simulation-time-ms", type=float, default=1000.0)
+    p.add_argument("--simulation-time-ms", type=float, default=5000.0)
     p.add_argument("--synapse-weight", type=float, default=1.0)
     p.add_argument("--synapse-delay-ms", type=float, default=1.5)
     p.add_argument("--use-graph-weights", action="store_true")
@@ -1250,9 +1080,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--record-to", type=str, default="memory", choices=["memory", "ascii", "none"])
     p.add_argument("--bin-size-ms", type=float, default=10.0)
     p.add_argument("--smoothing-sigma-ms", type=float, default=20.0)
-
-    p.add_argument("--no-npz", action="store_true")
-    p.add_argument("--no-csv", action="store_true")
 
     p.add_argument("--num-simulations", type=int, default=10_000)
     p.add_argument("--perturbation-mode", type=str, default="extra_poisson", choices=sorted(PERTURBATION_MODES))

@@ -9,24 +9,23 @@ original and perturbed trajectories normalised with statistics from the original
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import os
 from typing import Any, Literal, cast
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_NPZ_PATH = _REPO_ROOT / "data" / "simulated_neuron_dataset" / "dataset.npz"
-
-Split = Literal["train", "val", "test", "within"]
-TaskMode = Literal["forecasting", "perturbation"]
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_NPZ_PATH = os.path.join(ROOT_DIR, "data", "simulated_neuron_dataset", "dataset.npz")
+SPLITS = Literal["train", "val", "test", "within"]
+TASK_MODES = Literal["forecasting", "perturbation"]
 CROSS_SUBJECT_SPLITS: frozenset[str] = frozenset({"train", "val", "test"})
 
 
-def _read_run_config(npz_path: Path) -> dict[str, Any]:
-    path = npz_path.parent / "run_config.json"
-    if not path.is_file():
+def _read_run_config(npz_path: str) -> dict[str, Any]:
+    path = os.path.join(os.path.dirname(npz_path), "run_config.json")
+    if not os.path.isfile(path):
         return {}
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
@@ -74,30 +73,39 @@ class SNDataset(Dataset):
 
     def __init__(
         self,
-        npz_path: str | Path = DEFAULT_NPZ_PATH,
+        npz_path: str = DATA_NPZ_PATH,
         *,
-        task_mode: TaskMode = "forecasting",
-        split: Split = "train",
-        x: int = 50,
-        y: int = 20,
+        task_mode: TASK_MODES = "forecasting",
+        split: SPLITS = "train",
+        x: int = 90,
+        y: int = 30,
         stride: int = 1,
         train_frac: float = 0.8,
         val_frac: float = 0.1,
         split_seed: int = 0,
         cache: bool = False,
     ) -> None:
+        """
+        Args:
+            x: Number of context time bins given to the model as input
+                (`x[t : t + x]`) in forecasting mode.
+            y: Number of future time bins predicted by the model
+                (`y[t + x : t + x + y]`) in forecasting mode.
+                In perturbation mode, full trajectories are returned and
+                `x`/`y` are ignored.
+        """
         if split not in CROSS_SUBJECT_SPLITS and split != "within":
             raise ValueError(f"invalid split: {split!r}")
         if task_mode not in ("forecasting", "perturbation"):
             raise ValueError(f"invalid task_mode: {task_mode!r}")
 
-        path = Path(npz_path)
-        if not path.is_file():
-            raise FileNotFoundError(str(path))
+        path = os.path.abspath(os.fspath(npz_path))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
 
         self.npz_path = path
         self.task_mode = task_mode
-        self.split: Split = split
+        self.split: SPLITS = split
         self.x = x
         self.y = y
         self.stride = stride
@@ -216,7 +224,7 @@ class SNDataset(Dataset):
     def summary(self) -> str:
         return (
             f"SNDataset({self.task_mode=}, {self.split=}, {self.x=}, {self.y=}, {self.stride=}) "
-            f"n={len(self)} pool={len(self._subject_ids)} shape=({self.n_subjects},{self.n_channels},{self.n_bins})"
+            f"n={len(self)} pool={len(self._subject_ids)} shape=({len(self)},{self.n_channels},{self.n_bins})"
         )
 
     def close(self) -> None:
@@ -225,11 +233,11 @@ class SNDataset(Dataset):
 
 
 def make_dataloaders(
-    npz_path: str | Path = DEFAULT_NPZ_PATH,
+    npz_path: str = DATA_NPZ_PATH,
     *,
-    task_mode: TaskMode = "forecasting",
-    x: int = 50,
-    y: int = 20,
+    task_mode: TASK_MODES = "forecasting",
+    x: int = 90,
+    y: int = 30,
     stride: int = 1,
     batch_size: int = 32,
     num_workers: int = 2,
@@ -243,7 +251,7 @@ def make_dataloaders(
     pin = pin_memory and torch.cuda.is_available()
     out: dict[str, DataLoader] = {}
     for sp in ("train", "val", "test", "within"):
-        split: Split = cast(Split, sp)
+        split: SPLITS = cast(SPLITS, sp)
         ds = SNDataset(
             npz_path,
             task_mode=task_mode,
@@ -273,46 +281,49 @@ if __name__ == "__main__":
     import argparse
     import time
 
-    ap = argparse.ArgumentParser(description="Smoke-test SNDataset.")
-    ap.add_argument("npz_path", nargs="?", default=str(DEFAULT_NPZ_PATH))
-    ap.add_argument("--task-mode", choices=("forecasting", "perturbation"), default="forecasting")
-    ap.add_argument("--x", type=int, default=50)
-    ap.add_argument("--y", type=int, default=20)
+    ap = argparse.ArgumentParser(description="Unit tests for SNDataset.")
+    ap.add_argument("npz_path", nargs="?", default=str(DATA_NPZ_PATH))
+    ap.add_argument("--x", type=int, default=40)
+    ap.add_argument("--y", type=int, default=30)
     ap.add_argument("--stride", type=int, default=5)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--n-batches", type=int, default=2)
     args = ap.parse_args()
 
-    loaders = make_dataloaders(
-        args.npz_path,
-        task_mode=args.task_mode,  # type: ignore[arg-type]
-        x=args.x,
-        y=args.y,
-        stride=args.stride,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        verbose=True,
-    )
+    for task_mode in ("forecasting", "perturbation"):
+        print(f"\nSanity checking task mode: {task_mode}...\n\n")
 
-    for name, loader in loaders.items():
-        n = len(loader.dataset)  # type: ignore[arg-type]
-        if n == 0:
-            print(f"{name}: empty")
-            continue
-        t0 = time.perf_counter()
-        for i, batch in enumerate(loader):
-            if i == 0:
-                if args.task_mode == "forecasting":
-                    print(
-                        f"{name}: x={tuple(batch['x'].shape)} y={tuple(batch['y'].shape)} "
-                        f"subject={batch['meta']['subject_index'][:2]}"
-                    )
-                else:
-                    print(
-                        f"{name}: rates_original={tuple(batch['rates_original'].shape)} "
-                        f"subject={batch['meta']['subject_index'][:2]}"
-                    )
-            if i + 1 >= args.n_batches:
-                break
-        print(f"{name}: {args.n_batches} batches in {time.perf_counter() - t0:.2f}s")
+        loaders = make_dataloaders(
+            args.npz_path,
+            task_mode=task_mode,
+            x=args.x,
+            y=args.y,
+            stride=args.stride,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            verbose=True,
+        )
+
+        for name, loader in loaders.items():
+            n = len(loader.dataset)
+            if n == 0:
+                print(f"{name}: empty")
+                continue
+            t0 = time.perf_counter()
+            for i, batch in enumerate(loader):
+                if i == 0:
+                    if task_mode == "forecasting":
+                        print(
+                            f"{name}: x={tuple(batch['x'].shape)} y={tuple(batch['y'].shape)} "
+                            f"subject={batch['meta']['subject_index']}"
+                        )
+                    else:
+                        print(
+                            f"{name}: rates_original={tuple(batch['rates_original'].shape)} "
+                            f"{name}: rates_perturbed={tuple(batch['rates_perturbed'].shape)} "
+                            f"subject={batch['meta']['subject_index']}"
+                        )
+                if i + 1 >= args.n_batches:
+                    break
+            print(f"{name}: {args.n_batches} batches in {time.perf_counter() - t0:.2f}s")
