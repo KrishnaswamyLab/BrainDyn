@@ -101,6 +101,203 @@ def batch_to_model_tensors(batch: dict, device: torch.device) -> tuple[torch.Ten
     return x_history, y_true
 
 
+class SubjectRunDataset(torch.utils.data.Dataset):
+    """Dataset that yields one full timeseries per subject run.
+
+    Each item is a dict with:
+        ts   : (T, N) float32 tensor — raw z-scored timeseries
+        meta : dict — subject metadata
+    """
+
+    def __init__(self, base_dataset, indices):
+        """
+        Args:
+            base_dataset: ConcatDataset wrapping RBCDataset instances
+            indices: subset of sample indices to use (global indices into ConcatDataset)
+        """
+        # Collect unique (path, meta) pairs — deduplicate by path
+        seen_paths = {}
+        for idx in indices:
+            # For ConcatDataset, map global index to (dataset_idx, local_idx)
+            if hasattr(base_dataset, 'datasets') and hasattr(base_dataset, 'cumulative_sizes'):
+                dataset_idx = 0
+                local_idx = idx
+                for cumsum in base_dataset.cumulative_sizes:
+                    if idx >= cumsum:
+                        dataset_idx += 1
+                    else:
+                        local_idx = idx - (cumsum if dataset_idx > 0 else 0)
+                        break
+                # Ensure we're in the right dataset
+                if dataset_idx > 0:
+                    local_idx = idx - base_dataset.cumulative_sizes[dataset_idx - 1]
+                path, meta, _ = base_dataset.datasets[dataset_idx]._samples[local_idx]
+            else:
+                path, meta, _ = base_dataset._samples[idx]
+            if path not in seen_paths:
+                seen_paths[path] = meta
+        self._runs = [(path, meta) for path, meta in seen_paths.items()]
+
+    def __len__(self):
+        return len(self._runs)
+
+    def __getitem__(self, idx):
+        from data.rbc_dataset import _load_1d
+        path, meta = self._runs[idx]
+        ts = _load_1d(path)  # (T, N) float32
+        ts_t = torch.from_numpy(ts)  # (T, N)
+        # z-score across time per node
+        mean = ts_t.mean(dim=0, keepdim=True)
+        std = ts_t.std(dim=0, keepdim=True).clamp(min=1e-6)
+        ts_t = (ts_t - mean) / std
+        return {"ts": ts_t, "meta": meta}
+
+
+def run_epoch_ar_train(
+    model,
+    subject_loader,
+    edge_index,
+    dt,
+    x,
+    chunk_size,
+    tbptt_chunks,
+    optimizer,
+    lambda_mse,
+    lambda_mae,
+    grad_clip,
+    desc,
+    scaler=None,
+    teacher_forcing_prob: float = 1.0,
+):
+    """Full run-level autoregressive training with truncated BPTT and scheduled sampling.
+
+    For each subject run:
+      - Use first x timepoints as initial context.
+      - Roll forward across entire run in chunks of chunk_size.
+      - With probability teacher_forcing_prob, feed ground truth back into
+        context after each chunk (teacher forcing); otherwise feed model
+        predictions (free running). Scheduled sampling linearly decays
+        teacher_forcing_prob from 1.0 to 0.0 over training.
+    """
+    is_train = optimizer is not None
+    use_amp = scaler is not None
+    model.train(is_train)
+
+    total_running = 0.0
+    mse_running = 0.0
+    mae_running = 0.0
+    pcc_running = 0.0
+    scc_running = 0.0
+    n_chunks = 0
+    n_updates = 0
+
+    pbar = tqdm(subject_loader, desc=desc, leave=False)
+    for batch in pbar:
+        ts = batch["ts"]  # (B, T, N)
+        T = ts.shape[1]
+        N = ts.shape[2]
+
+        if T < x + chunk_size:
+            continue  # run too short to produce even one chunk
+
+        # Initial context: (B, N, x, 1)
+        hist = ts[:, :x, :].to(edge_index.device).permute(0, 2, 1).unsqueeze(-1)
+
+        chunk_idx = 0
+        t = x  # current position in the run
+
+        while t + chunk_size <= T:
+            # Zero gradients at the start of a TBPTT window
+            if is_train and chunk_idx % tbptt_chunks == 0:
+                optimizer.zero_grad(set_to_none=True)
+
+            # Ground truth for this chunk: (chunk_size, B, N, 1)
+            y_chunk = ts[:, t:t + chunk_size, :].to(edge_index.device)
+            y_chunk = y_chunk.permute(1, 0, 2).unsqueeze(-1)
+
+            with torch.set_grad_enabled(is_train):
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    out = model(
+                        x_history=hist,
+                        edge_index=edge_index,
+                        pred_steps=chunk_size,
+                        dt=dt,
+                        autoregressive=False,
+                    )
+                    y_pred = out["x_pred"]  # (chunk_size, B, N, 1)
+                    losses = total_loss(y_pred, y_chunk, lambda_mse=lambda_mse, lambda_mae=lambda_mae)
+                    loss = losses["total"] / tbptt_chunks  # normalize by tbptt_chunks for gradient averaging
+
+                if is_train:
+                    # Keep graph for intermediate chunks so gradients can flow
+                    # through the full TBPTT window; free it at the window end.
+                    will_step_now = ((chunk_idx + 1) % tbptt_chunks == 0) or (t + 2 * chunk_size > T)
+                    retain = not will_step_now
+                    if use_amp:
+                        scaler.scale(loss).backward(retain_graph=retain)
+                    else:
+                        loss.backward(retain_graph=retain)
+
+            total_running += float(losses["total"].detach().cpu())
+            mse_running += float(losses["mse"].detach().cpu())
+            mae_running += float(losses["mae"].detach().cpu())
+
+            y_pred_np = y_pred.detach().cpu().numpy().ravel()
+            y_chunk_np = y_chunk.detach().cpu().numpy().ravel()
+            pcc_val, _ = pearsonr(y_pred_np, y_chunk_np)
+            scc_val, _ = spearmanr(y_pred_np, y_chunk_np)
+            pcc_running += float(pcc_val)
+            scc_running += float(scc_val)
+            n_chunks += 1
+
+            # Decide whether to feed ground truth or predictions back into context
+            # During accumulation, don't detach to allow gradients to flow
+            if is_train and teacher_forcing_prob < 1.0 and random.random() > teacher_forcing_prob:
+                # Free-running: feed model predictions back (gradients flow during accumulation)
+                next_hist = y_pred.permute(1, 2, 0, 3)
+            else:
+                # Teacher forcing: feed ground truth back
+                next_hist = y_chunk.detach().permute(1, 2, 0, 3)
+            hist = torch.cat([hist[:, :, chunk_size:, :], next_hist], dim=2)
+
+            chunk_idx += 1
+            t += chunk_size
+
+            # Update params at the end of a TBPTT window
+            if is_train and (chunk_idx % tbptt_chunks == 0 or t + chunk_size > T):
+                if grad_clip > 0:
+                    if use_amp:
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                n_updates += 1
+                # Detach context after update to break gradient chain
+                hist = hist.detach()
+
+        pbar.set_postfix(
+            {
+                "total": f"{total_running / max(n_chunks, 1):.4f}",
+                "mse": f"{mse_running / max(n_chunks, 1):.4f}",
+                "pcc": f"{pcc_running / max(n_chunks, 1):.4f}",
+            }
+        )
+
+    if n_chunks == 0:
+        return {"total": float("nan"), "mse": float("nan"), "mae": float("nan"), "pcc": float("nan"), "scc": float("nan")}
+
+    return {
+        "total": total_running / n_chunks,
+        "mse": mse_running / n_chunks,
+        "mae": mae_running / n_chunks,
+        "pcc": pcc_running / n_chunks,
+        "scc": scc_running / n_chunks,
+    }
+
+
 def rollout_autoregressive(
     model,
     x_history,
@@ -413,14 +610,36 @@ def parse_args():
         "--forecast_mode",
         type=str,
         default="short",
-        choices=["short", "long"],
-        help="short: direct horizon prediction; long: autoregressive prediction by feeding predictions back",
+        choices=["short", "long", "long_ar_train"],
+        help=(
+            "short: direct horizon prediction; "
+            "long: window training + autoregressive inference; "
+            "long_ar_train: full run-level autoregressive training + inference"
+        ),
     )
     ap.add_argument(
         "--ar_chunk_size",
         type=int,
         default=1,
-        help="chunk size for autoregressive rollout when --forecast_mode=long",
+        help="chunk size for autoregressive rollout when --forecast_mode=long or long_ar_train",
+    )
+    ap.add_argument(
+        "--tbptt_chunks",
+        type=int,
+        default=5,
+        help="truncated BPTT: detach gradients every N chunks during long_ar_train",
+    )
+    ap.add_argument(
+        "--ss_start",
+        type=float,
+        default=1.0,
+        help="scheduled sampling: teacher forcing probability at epoch 1 (1.0 = full teacher forcing)",
+    )
+    ap.add_argument(
+        "--ss_end",
+        type=float,
+        default=0.0,
+        help="scheduled sampling: teacher forcing probability at final epoch (0.0 = full free-running)",
     )
     ap.add_argument(
         "--ablation_gat",
@@ -571,39 +790,97 @@ def main():
         if scaler is not None and fold_idx == 0:
             print("AMP enabled: using float16 for forward pass")
 
+        # For long_ar_train, build subject run loaders (full timeseries, no windowing)
+        if args.forecast_mode == "long_ar_train":
+            train_run_dataset = SubjectRunDataset(combined_dataset, train_idx)
+            val_run_dataset = SubjectRunDataset(combined_dataset, val_idx)
+            train_run_loader = DataLoader(
+                train_run_dataset,
+                batch_size=1,
+                shuffle=True,
+                num_workers=args.num_workers,
+                pin_memory=use_pin,
+                persistent_workers=(args.num_workers > 0),
+            )
+            val_run_loader = DataLoader(
+                val_run_dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=use_pin,
+                persistent_workers=(args.num_workers > 0),
+            )
+
         fold_save_path = save_path.with_name(f"{save_path.stem}_fold{fold_idx + 1}{save_path.suffix}")
         best_val = float("inf")
 
         for epoch in range(1, args.epochs + 1):
-            train_metrics = run_epoch(
-                model=model,
-                loader=train_loader,
-                edge_index=edge_index,
-                dt=args.dt,
-                optimizer=optimizer,
-                lambda_mse=args.lambda_mse,
-                lambda_mae=args.lambda_mae,
-                grad_clip=args.grad_clip,
-                desc=f"fold {fold_idx + 1} train {epoch}/{args.epochs}",
-                forecast_mode=args.forecast_mode,
-                ar_chunk_size=args.ar_chunk_size,
-                scaler=scaler,
-            )
-
-            with torch.no_grad():
-                val_metrics = run_epoch(
+            if args.forecast_mode == "long_ar_train":
+                # Linear decay of teacher forcing probability over epochs
+                tf_prob = args.ss_start + (args.ss_end - args.ss_start) * (epoch - 1) / max(args.epochs - 1, 1)
+                train_metrics = run_epoch_ar_train(
                     model=model,
-                    loader=val_loader,
+                    subject_loader=train_run_loader,
                     edge_index=edge_index,
                     dt=args.dt,
-                    optimizer=None,
+                    x=args.x,
+                    chunk_size=args.ar_chunk_size,
+                    tbptt_chunks=args.tbptt_chunks,
+                    optimizer=optimizer,
                     lambda_mse=args.lambda_mse,
                     lambda_mae=args.lambda_mae,
                     grad_clip=args.grad_clip,
-                    desc=f"fold {fold_idx + 1} val {epoch}/{args.epochs}",
+                    desc=f"fold {fold_idx + 1} train {epoch}/{args.epochs} [tf={tf_prob:.2f}]",
+                    scaler=scaler,
+                    teacher_forcing_prob=tf_prob,
+                )
+            else:
+                train_metrics = run_epoch(
+                    model=model,
+                    loader=train_loader,
+                    edge_index=edge_index,
+                    dt=args.dt,
+                    optimizer=optimizer,
+                    lambda_mse=args.lambda_mse,
+                    lambda_mae=args.lambda_mae,
+                    grad_clip=args.grad_clip,
+                    desc=f"fold {fold_idx + 1} train {epoch}/{args.epochs}",
                     forecast_mode=args.forecast_mode,
                     ar_chunk_size=args.ar_chunk_size,
+                    scaler=scaler,
                 )
+
+            with torch.no_grad():
+                if args.forecast_mode == "long_ar_train":
+                    val_metrics = run_epoch_ar_train(
+                        model=model,
+                        subject_loader=val_run_loader,
+                        edge_index=edge_index,
+                        dt=args.dt,
+                        x=args.x,
+                        chunk_size=args.ar_chunk_size,
+                        tbptt_chunks=args.tbptt_chunks,
+                        optimizer=None,
+                        lambda_mse=args.lambda_mse,
+                        lambda_mae=args.lambda_mae,
+                        grad_clip=args.grad_clip,
+                        desc=f"fold {fold_idx + 1} val {epoch}/{args.epochs}",
+                        teacher_forcing_prob=0.0,
+                    )
+                else:
+                    val_metrics = run_epoch(
+                        model=model,
+                        loader=val_loader,
+                        edge_index=edge_index,
+                        dt=args.dt,
+                        optimizer=None,
+                        lambda_mse=args.lambda_mse,
+                        lambda_mae=args.lambda_mae,
+                        grad_clip=args.grad_clip,
+                        desc=f"fold {fold_idx + 1} val {epoch}/{args.epochs}",
+                        forecast_mode=args.forecast_mode,
+                        ar_chunk_size=args.ar_chunk_size,
+                    )
 
             prev_lr = optimizer.param_groups[0]["lr"]
             scheduler.step(val_metrics["total"])

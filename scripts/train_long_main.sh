@@ -4,7 +4,7 @@
 #SBATCH --time=20:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --partition=gpu
-#SBATCH --gpus=1
+#SBATCH --qos=qos_nmi --gres=gpu:h200:1
 #SBATCH --mem=256G
 #SBATCH --output=./logs/slurm/%x_%j.out
 #SBATCH --error=./logs/slurm/%x_%j.err
@@ -20,9 +20,9 @@ COHORT_LOWER="${COHORT,,}"
 uv run main.py \
   --cohort "$COHORT" \
   --x 30 \
-  --y 30 \
+  --y 10 \
   --forecast_mode long \
-  --ar_chunk_size 1 \
+  --ar_chunk_size 5 \
   --amp \
   --no_pin_memory \
   --lr 1e-3 \

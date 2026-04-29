@@ -444,8 +444,11 @@ def plot_sheaf_directional_weights(src_weight, dst_weight, out_path):
     """Plot learned directional sheaf weights as a compact bar chart."""
     set_plot_style()
 
+    src_scalar = float(np.asarray(src_weight).mean())
+    dst_scalar = float(np.asarray(dst_weight).mean())
+
     labels = ["src_weight", "dst_weight"]
-    values = [float(src_weight), float(dst_weight)]
+    values = [src_scalar, dst_scalar]
     colors = ["#2563eb", "#dc2626"]
 
     fig, ax = plt.subplots(figsize=(5.8, 4.2))
@@ -696,8 +699,8 @@ def main():
                 spatial_edge_count[step] += 1
 
                 if ("src_weight" in aux) and ("dst_weight" in aux):
-                    src_weight_sum += float(aux["src_weight"].detach().cpu().item())
-                    dst_weight_sum += float(aux["dst_weight"].detach().cpu().item())
+                    src_weight_sum += float(aux["src_weight"].detach().cpu().mean().item())
+                    dst_weight_sum += float(aux["dst_weight"].detach().cpu().mean().item())
                     sheaf_weight_count += 1
 
                 inbound = np.zeros((num_nodes,), dtype=np.float64)

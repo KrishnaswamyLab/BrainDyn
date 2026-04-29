@@ -18,8 +18,9 @@ class SheafLaplacian(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_nodes = num_nodes
-        self.src_weight_logit = nn.Parameter(torch.tensor(0.0))
-        self.dst_weight_logit = nn.Parameter(torch.tensor(0.0))
+        # Directional gates are learned per node and per sheaf channel.
+        self.src_weight_table = nn.Parameter(torch.ones(num_nodes, map_hidden_dim))
+        self.dst_weight_table = nn.Parameter(torch.ones(num_nodes, map_hidden_dim))
         self.restriction_maps = nn.Parameter(torch.empty(num_nodes, hidden_dim, map_hidden_dim))
         nn.init.xavier_uniform_(self.restriction_maps)
 
@@ -61,8 +62,8 @@ class SheafLaplacian(nn.Module):
         tilde_src_norm = self._minmax_normalize(tilde_src)
         tilde_dst_norm = self._minmax_normalize(tilde_dst)
 
-        src_weight = torch.sigmoid(self.src_weight_logit)
-        dst_weight = torch.sigmoid(self.dst_weight_logit)
+        src_weight = torch.sigmoid(self.src_weight_table[src]).unsqueeze(0)
+        dst_weight = torch.sigmoid(self.dst_weight_table[dst]).unsqueeze(0)
 
         delta = dst_weight * tilde_dst_norm - src_weight * tilde_src_norm
         msg_src = torch.einsum("beh,edh->bed", -delta, rho_src)
