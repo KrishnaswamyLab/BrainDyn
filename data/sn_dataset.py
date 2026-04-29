@@ -224,7 +224,7 @@ class SNDataset(Dataset):
     def summary(self) -> str:
         return (
             f"SNDataset({self.task_mode=}, {self.split=}, {self.x=}, {self.y=}, {self.stride=}) "
-            f"n={len(self)} pool={len(self._subject_ids)} shape=({len(self)},{self.n_channels},{self.n_bins})"
+            f"n={len(self)} pool={len(self._subject_ids)} shape=({len(self)},{self.n_bins},{self.n_channels})"
         )
 
     def close(self) -> None:
@@ -322,7 +322,7 @@ if __name__ == "__main__":
                         print(
                             f"{name}: rates_original={tuple(batch['rates_original'].shape)} "
                             f"{name}: rates_perturbed={tuple(batch['rates_perturbed'].shape)} "
-                            f"subject={batch['meta']['subject_index']}"
+                            f"metadata={batch['meta']}"
                         )
                 if i + 1 >= args.n_batches:
                     break
