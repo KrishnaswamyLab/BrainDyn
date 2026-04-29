@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -109,11 +110,12 @@ class SubjectRunDataset(torch.utils.data.Dataset):
         meta : dict — subject metadata
     """
 
-    def __init__(self, base_dataset, indices):
+    def __init__(self, base_dataset, indices, use_cache: bool = False):
         """
         Args:
             base_dataset: ConcatDataset wrapping RBCDataset instances
             indices: subset of sample indices to use (global indices into ConcatDataset)
+            use_cache: cache normalized run tensors by path in worker memory
         """
         # Collect unique (path, meta) pairs — deduplicate by path
         seen_paths = {}
@@ -137,6 +139,8 @@ class SubjectRunDataset(torch.utils.data.Dataset):
             if path not in seen_paths:
                 seen_paths[path] = meta
         self._runs = [(path, meta) for path, meta in seen_paths.items()]
+        self._use_cache = use_cache
+        self._cache: dict[str, torch.Tensor] = {}
 
     def __len__(self):
         return len(self._runs)
@@ -144,12 +148,17 @@ class SubjectRunDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         from data.rbc_dataset import _load_1d
         path, meta = self._runs[idx]
-        ts = _load_1d(path)  # (T, N) float32
-        ts_t = torch.from_numpy(ts)  # (T, N)
-        # z-score across time per node
-        mean = ts_t.mean(dim=0, keepdim=True)
-        std = ts_t.std(dim=0, keepdim=True).clamp(min=1e-6)
-        ts_t = (ts_t - mean) / std
+        if self._use_cache and path in self._cache:
+            ts_t = self._cache[path]
+        else:
+            ts = _load_1d(path)  # (T, N) float32
+            ts_t = torch.from_numpy(ts)  # (T, N)
+            # z-score across time per node
+            mean = ts_t.mean(dim=0, keepdim=True)
+            std = ts_t.std(dim=0, keepdim=True).clamp(min=1e-6)
+            ts_t = (ts_t - mean) / std
+            if self._use_cache:
+                self._cache[path] = ts_t
         return {"ts": ts_t, "meta": meta}
 
 
@@ -186,10 +195,7 @@ def run_epoch_ar_train(
     total_running = 0.0
     mse_running = 0.0
     mae_running = 0.0
-    pcc_running = 0.0
-    scc_running = 0.0
     n_chunks = 0
-    n_updates = 0
 
     pbar = tqdm(subject_loader, desc=desc, leave=False)
     for batch in pbar:
@@ -242,12 +248,6 @@ def run_epoch_ar_train(
             mse_running += float(losses["mse"].detach().cpu())
             mae_running += float(losses["mae"].detach().cpu())
 
-            y_pred_np = y_pred.detach().cpu().numpy().ravel()
-            y_chunk_np = y_chunk.detach().cpu().numpy().ravel()
-            pcc_val, _ = pearsonr(y_pred_np, y_chunk_np)
-            scc_val, _ = spearmanr(y_pred_np, y_chunk_np)
-            pcc_running += float(pcc_val)
-            scc_running += float(scc_val)
             n_chunks += 1
 
             # Decide whether to feed ground truth or predictions back into context
@@ -274,7 +274,6 @@ def run_epoch_ar_train(
                     scaler.update()
                 else:
                     optimizer.step()
-                n_updates += 1
                 # Detach context after update to break gradient chain
                 hist = hist.detach()
 
@@ -282,7 +281,6 @@ def run_epoch_ar_train(
             {
                 "total": f"{total_running / max(n_chunks, 1):.4f}",
                 "mse": f"{mse_running / max(n_chunks, 1):.4f}",
-                "pcc": f"{pcc_running / max(n_chunks, 1):.4f}",
             }
         )
 
@@ -293,8 +291,8 @@ def run_epoch_ar_train(
         "total": total_running / n_chunks,
         "mse": mse_running / n_chunks,
         "mae": mae_running / n_chunks,
-        "pcc": pcc_running / n_chunks,
-        "scc": scc_running / n_chunks,
+        "pcc": float("nan"),
+        "scc": float("nan"),
     }
 
 
@@ -792,8 +790,8 @@ def main():
 
         # For long_ar_train, build subject run loaders (full timeseries, no windowing)
         if args.forecast_mode == "long_ar_train":
-            train_run_dataset = SubjectRunDataset(combined_dataset, train_idx)
-            val_run_dataset = SubjectRunDataset(combined_dataset, val_idx)
+            train_run_dataset = SubjectRunDataset(combined_dataset, train_idx, use_cache=args.cache)
+            val_run_dataset = SubjectRunDataset(combined_dataset, val_idx, use_cache=args.cache)
             train_run_loader = DataLoader(
                 train_run_dataset,
                 batch_size=1,
@@ -815,9 +813,11 @@ def main():
         best_val = float("inf")
 
         for epoch in range(1, args.epochs + 1):
+            epoch_start = time.perf_counter()
             if args.forecast_mode == "long_ar_train":
                 # Linear decay of teacher forcing probability over epochs
                 tf_prob = args.ss_start + (args.ss_end - args.ss_start) * (epoch - 1) / max(args.epochs - 1, 1)
+                train_start = time.perf_counter()
                 train_metrics = run_epoch_ar_train(
                     model=model,
                     subject_loader=train_run_loader,
@@ -834,7 +834,9 @@ def main():
                     scaler=scaler,
                     teacher_forcing_prob=tf_prob,
                 )
+                train_time_s = time.perf_counter() - train_start
             else:
+                train_start = time.perf_counter()
                 train_metrics = run_epoch(
                     model=model,
                     loader=train_loader,
@@ -849,7 +851,9 @@ def main():
                     ar_chunk_size=args.ar_chunk_size,
                     scaler=scaler,
                 )
+                train_time_s = time.perf_counter() - train_start
 
+            val_start = time.perf_counter()
             with torch.no_grad():
                 if args.forecast_mode == "long_ar_train":
                     val_metrics = run_epoch_ar_train(
@@ -881,6 +885,7 @@ def main():
                         forecast_mode=args.forecast_mode,
                         ar_chunk_size=args.ar_chunk_size,
                     )
+            val_time_s = time.perf_counter() - val_start
 
             prev_lr = optimizer.param_groups[0]["lr"]
             scheduler.step(val_metrics["total"])
@@ -889,12 +894,15 @@ def main():
             if new_lr < prev_lr:
                 lr_msg += " (reduced)"
 
+            epoch_time_s = time.perf_counter() - epoch_start
+
             print(
                 f"Fold {fold_idx + 1}/{args.cv_folds} Epoch {epoch:03d} | "
                 f"train total={train_metrics['total']:.6f} mse={train_metrics['mse']:.6f} mae={train_metrics['mae']:.6f} "
                 f"pcc={train_metrics['pcc']:.4f} scc={train_metrics['scc']:.4f} | "
                 f"val total={val_metrics['total']:.6f} mse={val_metrics['mse']:.6f} mae={val_metrics['mae']:.6f} "
                 f"pcc={val_metrics['pcc']:.4f} scc={val_metrics['scc']:.4f}"
+                f" | t_train={train_time_s:.1f}s t_val={val_time_s:.1f}s t_epoch={epoch_time_s:.1f}s"
                 f"{lr_msg}"
             )
 
