@@ -1,7 +1,7 @@
 #!/bin/bash
 
-#SBATCH --job-name=braindyn_short_ablgat
-#SBATCH --time=2-00:00:00
+#SBATCH --job-name=braindyn_short_ablgcn
+#SBATCH --time=20:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --partition=gpu
 #SBATCH --qos=qos_nmi --gres=gpu:h200:1

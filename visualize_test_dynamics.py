@@ -18,7 +18,7 @@ def parse_args():
     ap = argparse.ArgumentParser(
                 description="Visualize autoregressive test-rollout dynamics on the TEST split."
     )
-    ap.add_argument("--checkpoint", type=str, default="checkpoints/braindyn_rbc_pnc_best_fold1.pt")
+    ap.add_argument("--checkpoint", type=str, default="checkpoints/braindyn_rbc_pnc_long_main_best_fold5.pt")
     ap.add_argument("--manifest_csv", type=str, default=None, help="Defaults to training config from checkpoint")
     ap.add_argument("--cohort", type=str, default=None, help="PNC, HBN, or None (defaults to checkpoint config)")
     ap.add_argument("--batch_size", type=int, default=8)
@@ -26,6 +26,12 @@ def parse_args():
     ap.add_argument("--cache", action="store_true")
     ap.add_argument("--no_pin_memory", action="store_true")
     ap.add_argument("--max_runs", type=int, default=None, help="Optional cap on the number of test runs to roll out")
+    ap.add_argument(
+        "--rollout_steps",
+        type=int,
+        default=30,
+        help="For forecast_mode=long, cap autoregressive rollout to this many future timepoints per run.",
+    )
     ap.add_argument("--n_rois", type=int, default=6, help="Number of evenly-spaced ROI traces to show per sample")
     ap.add_argument("--n_extreme_rois", type=int, default=3, help="Number of best- and worst-MSE ROIs to show per sample")
     ap.add_argument("--n_samples", type=int, default=3, help="Number of sample plots to save")
@@ -226,6 +232,9 @@ def plot_rollout_sample(
 
 def main():
     args = parse_args()
+    if args.rollout_steps is not None and args.rollout_steps <= 0:
+        raise ValueError(f"rollout_steps must be positive when set, got {args.rollout_steps}")
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -333,7 +342,10 @@ def main():
                 hist = hist.unsqueeze(0).permute(0, 2, 1).unsqueeze(-1)
 
                 current_t = t0 + x
-                remaining = run_len - current_t
+                max_pred_steps = run_len - current_t
+                if args.rollout_steps is not None:
+                    max_pred_steps = min(max_pred_steps, args.rollout_steps)
+                remaining = max_pred_steps
                 pred_chunks = []
                 gt_chunks = []
                 gt_raw_chunks = []
@@ -376,7 +388,7 @@ def main():
                     hist = torch.cat([hist[:, :, step:, :], pred_hist], dim=2)
 
                     current_t += step
-                    remaining = run_len - current_t
+                    remaining -= step
 
                     pbar.set_postfix(
                         {
@@ -512,6 +524,7 @@ def main():
         "ode_method": ode_method,
         "forecast_mode": forecast_mode,
         "ar_chunk_size": ar_chunk_size,
+        "rollout_steps": args.rollout_steps,
         "ablation_gat": use_gat,
         "ablation_no_lstm": (not use_lstm_encoder),
         "lambda_mse": lambda_mse,

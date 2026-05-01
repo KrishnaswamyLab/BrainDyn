@@ -63,17 +63,42 @@ class BrainDynDynamics(nn.Module):
             nn.Linear(vf_hidden_dim, signal_dim),
         )
 
+    def compute_lap_h(
+        self,
+        x_hist: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict]:
+        """Compute the history-dependent graph-diffused encoding (LSTM + Laplacian).
+
+        Exposed separately so callers can pre-compute it once when x_hist is
+        frozen across multiple evaluations (e.g. inside an ODE RHS closure).
+
+        Returns:
+            lap_h: (B, N, H)
+            aux:   dict with h_t and graph aux keys
+        """
+        if self.use_lstm_encoder:
+            h_t = self.temporal_encoder(x_hist)  # (B, N, H)
+        else:
+            h_t = torch.tanh(self.no_lstm_proj(x_hist[:, :, -1, :]))
+        lap_h, graph_aux = self.graph_laplacian(h_t, edge_index)  # (B, N, H)
+        return lap_h, {"h_t": h_t, **graph_aux}
+
     def forward(
         self,
         x_hist,
         edge_index,
         x_eval=None,
+        precomputed_lap_h: torch.Tensor | None = None,
     ):
         """
         x_hist: (B, N, T, F)
         edge_index: (2, E)
         x_eval: optional signal at which to evaluate the derivative, shape (B, N, F).
                 If None, uses the last signal in the history window.
+        precomputed_lap_h: if provided, skips LSTM + graph computation and uses
+                this directly — (B, N, H). Only pass this when x_hist is frozen
+                (e.g. inside the ODE RHS closure with precompute_lap_h=True).
 
         returns:
             dxdt: (B, N, F)
@@ -85,12 +110,15 @@ class BrainDynDynamics(nn.Module):
             raise ValueError(f"Expected history length {self.window_size}, got {x_hist.shape[2]}")
 
         x_t = x_hist[:, :, -1, :] if x_eval is None else x_eval
-        if self.use_lstm_encoder:
-            h_t = self.temporal_encoder(x_hist)  # (B, N, H)
-        else:
-            h_t = torch.tanh(self.no_lstm_proj(x_hist[:, :, -1, :]))
 
-        lap_h, graph_aux = self.graph_laplacian(h_t, edge_index)  # (B, N, H)
+        if precomputed_lap_h is not None:
+            lap_h = precomputed_lap_h
+            h_t = None
+            graph_aux: dict = {}
+        else:
+            lap_h, enc_aux = self.compute_lap_h(x_hist, edge_index)
+            h_t = enc_aux.pop("h_t")
+            graph_aux = enc_aux
 
         vf_input = torch.cat([x_t, lap_h], dim=-1)
         dxdt = self.vector_field(vf_input)

@@ -9,3 +9,4 @@ checkpoints/
 outputs/
 *.csv
 *.json
+*.h5

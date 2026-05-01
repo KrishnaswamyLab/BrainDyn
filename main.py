@@ -12,6 +12,12 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 from tqdm import tqdm
 
 from data.rbc_dataset import make_dataloaders
+from data.eeg_h5_dataset import (
+    NUM_CHANNELS,
+    FREQUENCY,
+    load_timeseries_seconds,
+    make_eeg_dataloaders,
+)
 from model.braindyn import BrainDyn, BrainDynConfig
 from model.losses import total_loss
 
@@ -110,7 +116,7 @@ class SubjectRunDataset(torch.utils.data.Dataset):
         meta : dict — subject metadata
     """
 
-    def __init__(self, base_dataset, indices, use_cache: bool = False):
+    def __init__(self, base_dataset, indices, run_loader, use_cache: bool = False):
         """
         Args:
             base_dataset: ConcatDataset wrapping RBCDataset instances
@@ -139,6 +145,7 @@ class SubjectRunDataset(torch.utils.data.Dataset):
             if path not in seen_paths:
                 seen_paths[path] = meta
         self._runs = [(path, meta) for path, meta in seen_paths.items()]
+        self._run_loader = run_loader
         self._use_cache = use_cache
         self._cache: dict[str, torch.Tensor] = {}
 
@@ -146,12 +153,11 @@ class SubjectRunDataset(torch.utils.data.Dataset):
         return len(self._runs)
 
     def __getitem__(self, idx):
-        from data.rbc_dataset import _load_1d
         path, meta = self._runs[idx]
         if self._use_cache and path in self._cache:
             ts_t = self._cache[path]
         else:
-            ts = _load_1d(path)  # (T, N) float32
+            ts = self._run_loader(path)  # (T, N) float32
             ts_t = torch.from_numpy(ts)  # (T, N)
             # z-score across time per node
             mean = ts_t.mean(dim=0, keepdim=True)
@@ -188,6 +194,9 @@ def run_epoch_ar_train(
         predictions (free running). Scheduled sampling linearly decays
         teacher_forcing_prob from 1.0 to 0.0 over training.
     """
+    if not (0.0 <= teacher_forcing_prob <= 1.0):
+        raise ValueError(f"teacher_forcing_prob must be in [0, 1], got {teacher_forcing_prob}")
+
     is_train = optimizer is not None
     use_amp = scaler is not None
     model.train(is_train)
@@ -196,6 +205,9 @@ def run_epoch_ar_train(
     mse_running = 0.0
     mae_running = 0.0
     n_chunks = 0
+    # Accumulate flattened predictions and targets for epoch-level PCC/SCC
+    pred_accum: list[np.ndarray] = []
+    true_accum: list[np.ndarray] = []
 
     pbar = tqdm(subject_loader, desc=desc, leave=False)
     for batch in pbar:
@@ -222,7 +234,7 @@ def run_epoch_ar_train(
             y_chunk = y_chunk.permute(1, 0, 2).unsqueeze(-1)
 
             with torch.set_grad_enabled(is_train):
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     out = model(
                         x_history=hist,
                         edge_index=edge_index,
@@ -248,16 +260,29 @@ def run_epoch_ar_train(
             mse_running += float(losses["mse"].detach().cpu())
             mae_running += float(losses["mae"].detach().cpu())
 
+            pred_accum.append(y_pred.detach().cpu().numpy().ravel())
+            true_accum.append(y_chunk.detach().cpu().numpy().ravel())
+
             n_chunks += 1
 
-            # Decide whether to feed ground truth or predictions back into context
-            # During accumulation, don't detach to allow gradients to flow
-            if is_train and teacher_forcing_prob < 1.0 and random.random() > teacher_forcing_prob:
-                # Free-running: feed model predictions back (gradients flow during accumulation)
-                next_hist = y_pred.permute(1, 2, 0, 3)
+            # Decide whether to feed ground truth or predictions back into context.
+            # During eval, teacher_forcing_prob=0.0 means fully free-running rollout.
+            if teacher_forcing_prob >= 1.0:
+                use_teacher_forcing = True
+            elif teacher_forcing_prob <= 0.0:
+                use_teacher_forcing = False
+            elif is_train:
+                use_teacher_forcing = random.random() < teacher_forcing_prob
             else:
-                # Teacher forcing: feed ground truth back
+                # Keep eval deterministic for intermediate probabilities.
+                use_teacher_forcing = False
+
+            if use_teacher_forcing:
+                # Teacher forcing: feed ground truth back.
                 next_hist = y_chunk.detach().permute(1, 2, 0, 3)
+            else:
+                # Free-running: feed model predictions back.
+                next_hist = y_pred.permute(1, 2, 0, 3)
             hist = torch.cat([hist[:, :, chunk_size:, :], next_hist], dim=2)
 
             chunk_idx += 1
@@ -287,12 +312,17 @@ def run_epoch_ar_train(
     if n_chunks == 0:
         return {"total": float("nan"), "mse": float("nan"), "mae": float("nan"), "pcc": float("nan"), "scc": float("nan")}
 
+    all_pred = np.concatenate(pred_accum)
+    all_true = np.concatenate(true_accum)
+    pcc_val, _ = pearsonr(all_pred, all_true)
+    scc_val, _ = spearmanr(all_pred, all_true)
+
     return {
         "total": total_running / n_chunks,
         "mse": mse_running / n_chunks,
         "mae": mae_running / n_chunks,
-        "pcc": float("nan"),
-        "scc": float("nan"),
+        "pcc": float(pcc_val),
+        "scc": float(scc_val),
     }
 
 
@@ -364,7 +394,7 @@ def run_epoch(
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(is_train):
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 if forecast_mode == "short":
                     out = model(
                         x_history=x_history,
@@ -444,13 +474,17 @@ def run_test_rollout_chunks(
     dt,
     chunk_steps,
     context_len,
+    rollout_steps,
     lambda_mse,
     lambda_mae,
     desc,
+    run_loader,
 ):
     """Evaluate test split by autoregressive chunk rollout over full runs."""
     if chunk_steps <= 0:
         raise ValueError(f"chunk_steps must be positive, got {chunk_steps}")
+    if rollout_steps is not None and rollout_steps <= 0:
+        raise ValueError(f"rollout_steps must be positive when set, got {rollout_steps}")
 
     # Use the earliest available context window per run to avoid duplicate run rollouts.
     run_starts: dict[str, tuple[int, int]] = {}
@@ -471,7 +505,7 @@ def run_test_rollout_chunks(
 
     pbar = tqdm(run_starts.items(), desc=desc, leave=False)
     for path, (t0, T) in pbar:
-        ts = np.loadtxt(path, delimiter=",", comments="#", dtype=np.float32)
+        ts = run_loader(path)
         if t0 + context_len >= T:
             continue
 
@@ -484,7 +518,10 @@ def run_test_rollout_chunks(
         hist = hist.unsqueeze(0).permute(0, 2, 1).unsqueeze(-1)  # (1, N, x, 1)
 
         current_t = t0 + context_len
-        remaining = T - current_t
+        max_pred_steps = T - current_t
+        if rollout_steps is not None:
+            max_pred_steps = min(max_pred_steps, rollout_steps)
+        remaining = max_pred_steps
         while remaining > 0:
             step = min(chunk_steps, remaining)
             out = model(
@@ -518,7 +555,7 @@ def run_test_rollout_chunks(
             hist = torch.cat([hist[:, :, step:, :], pred_hist], dim=2)
 
             current_t += step
-            remaining = T - current_t
+            remaining -= step
 
             pbar.set_postfix(
                 {
@@ -554,9 +591,25 @@ def make_subset_loader(dataset, indices, batch_size, num_workers, pin_memory, sh
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Train BrainDyn on RBC.")
+    ap = argparse.ArgumentParser(description="Train BrainDyn on fMRI or EEG timeseries.")
 
+    ap.add_argument(
+        "--dataset",
+        type=str,
+        default="fmri",
+        choices=["fmri", "eeg"],
+        help="dataset backend: fmri (RBC manifest CSV) or eeg (HDF5 root)",
+    )
     ap.add_argument("--manifest_csv", type=str, default="data/manifest.csv")
+    ap.add_argument("--eeg_h5_root", type=str, default="data/eeg_h5")
+    ap.add_argument(
+        "--eeg_manifest_csv",
+        type=str,
+        default="data/tusz_manifest.csv",
+        help="EEG manifest CSV (same role as --manifest_csv for fMRI)",
+    )
+    ap.add_argument("--eeg_frequency", type=int, default=FREQUENCY, help="EEG sampling rate used in HDF5 resampled_signal")
+    ap.add_argument("--eeg_num_channels", type=int, default=NUM_CHANNELS, help="EEG channel count (nodes); default 19")
     ap.add_argument("--cohort", type=str, default=None, help="PNC, HBN, or None for both")
     ap.add_argument("--x", type=int, default=30, help="context length")
     ap.add_argument("--y", type=int, default=10, help="forecast horizon length")
@@ -565,7 +618,7 @@ def parse_args():
     ap.add_argument("--cache", action="store_true")
 
     ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--num_workers", type=int, default=2)
+    ap.add_argument("--num_workers", type=int, default=8)
     ap.add_argument("--cv_folds", type=int, default=5, help="number of train/val cross-validation folds")
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -622,6 +675,12 @@ def parse_args():
         help="chunk size for autoregressive rollout when --forecast_mode=long or long_ar_train",
     )
     ap.add_argument(
+        "--test_rollout_steps",
+        type=int,
+        default=None,
+        help="when --forecast_mode=long, cap test autoregressive rollout to this many future timepoints (default: full remaining run)",
+    )
+    ap.add_argument(
         "--tbptt_chunks",
         type=int,
         default=5,
@@ -655,6 +714,25 @@ def parse_args():
         action="store_true",
         help="Ablation 2: disable LSTM temporal encoder and use last-step linear projection",
     )
+    ap.add_argument(
+        "--precompute_lap_h",
+        action="store_true",
+        help="Pre-compute LSTM + graph Laplacian once per ODE chunk instead of at every RHS evaluation. "
+             "Mathematically equivalent; faster when chunk_size > 1 and ode_method has multiple stages (e.g. rk4).",
+    )
+    ap.add_argument(
+        "--run_batch_size",
+        type=int,
+        default=1,
+        help="Batch size for the per-run AR training DataLoader. All runs must have identical T for batch_size>1 "
+             "(true for fixed-protocol datasets like PNC). Larger values improve GPU utilization significantly.",
+    )
+    ap.add_argument(
+        "--val_every",
+        type=int,
+        default=1,
+        help="Run validation every N epochs (default 1 = every epoch). Skipped epochs still train and log train metrics.",
+    )
     return ap.parse_args()
 
 
@@ -666,22 +744,60 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    manifest_csv = Path(args.manifest_csv)
-    if not manifest_csv.exists():
-        raise FileNotFoundError(f"Manifest not found: {manifest_csv}")
+    if args.dataset == "fmri":
+        manifest_csv = Path(args.manifest_csv)
+        if not manifest_csv.exists():
+            raise FileNotFoundError(f"Manifest not found: {manifest_csv}")
 
-    loaders = make_dataloaders(
-        manifest_csv=manifest_csv,
-        x=args.x,
-        y=args.y,
-        stride=args.stride,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        cohort=args.cohort,
-        min_t=args.min_t,
-        cache=args.cache,
-        pin_memory=not args.no_pin_memory,
-    )
+        loaders = make_dataloaders(
+            manifest_csv=manifest_csv,
+            x=args.x,
+            y=args.y,
+            stride=args.stride,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            cohort=args.cohort,
+            min_t=args.min_t,
+            cache=args.cache,
+            pin_memory=not args.no_pin_memory,
+        )
+
+        def run_loader(path: str) -> np.ndarray:
+            return np.loadtxt(path, delimiter=",", comments="#", dtype=np.float32)
+
+    elif args.dataset == "eeg":
+        eeg_h5_root = Path(args.eeg_h5_root)
+        if not eeg_h5_root.exists():
+            raise FileNotFoundError(f"EEG HDF5 root not found: {eeg_h5_root}")
+        eeg_manifest_csv = Path(args.eeg_manifest_csv)
+        if not eeg_manifest_csv.exists():
+            raise FileNotFoundError(f"EEG manifest not found: {eeg_manifest_csv}")
+
+        loaders = make_eeg_dataloaders(
+            h5_root=eeg_h5_root,
+            x=args.x,
+            y=args.y,
+            stride=args.stride,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            manifest_csv=eeg_manifest_csv,
+            min_t=args.min_t,
+            cache=args.cache,
+            pin_memory=not args.no_pin_memory,
+            frequency=args.eeg_frequency,
+            num_channels=args.eeg_num_channels,
+        )
+
+        def run_loader(path: str) -> np.ndarray:
+            return load_timeseries_seconds(
+                Path(path),
+                frequency=args.eeg_frequency,
+                num_channels=args.eeg_num_channels,
+            )
+
+    else:
+        raise ValueError(f"Unknown dataset '{args.dataset}'.")
+
     train_dataset = loaders["train"].dataset
     val_dataset = loaders["val"].dataset
     test_loader = loaders["test"]
@@ -697,7 +813,10 @@ def main():
             f"Not enough combined train+val samples ({len(combined_dataset)}) for {args.cv_folds}-fold CV"
         )
 
-    cohort_tag = (args.cohort or "all").lower()
+    if args.dataset == "fmri":
+        cohort_tag = (args.cohort or "all").lower()
+    else:
+        cohort_tag = "all"
     forecast_tag = args.forecast_mode
     ablation_parts = []
     if args.ablation_gat:
@@ -708,7 +827,7 @@ def main():
 
     default_save_path = "checkpoints/braindyn_rbc_best.pt"
     resolved_save_path = (
-        f"checkpoints/braindyn_rbc_{cohort_tag}_{forecast_tag}_{ablation_tag}_best.pt"
+        f"checkpoints/braindyn_{args.dataset}_{cohort_tag}_{forecast_tag}_{ablation_tag}_best.pt"
         if args.save_path == default_save_path
         else args.save_path
     )
@@ -769,6 +888,7 @@ def main():
             ode_method=args.ode_method,
             use_gat=args.ablation_gat,
             use_lstm_encoder=(not args.ablation_no_lstm),
+            precompute_lap_h=args.precompute_lap_h,
         )
         model = BrainDyn(config).to(device)
         print(
@@ -784,17 +904,27 @@ def main():
             min_lr=args.lr_min,
         )
 
-        scaler = torch.cuda.amp.GradScaler() if (args.amp and torch.cuda.is_available()) else None
+        scaler = torch.amp.GradScaler("cuda") if (args.amp and torch.cuda.is_available()) else None
         if scaler is not None and fold_idx == 0:
             print("AMP enabled: using float16 for forward pass")
 
         # For long_ar_train, build subject run loaders (full timeseries, no windowing)
         if args.forecast_mode == "long_ar_train":
-            train_run_dataset = SubjectRunDataset(combined_dataset, train_idx, use_cache=args.cache)
-            val_run_dataset = SubjectRunDataset(combined_dataset, val_idx, use_cache=args.cache)
+            train_run_dataset = SubjectRunDataset(
+                combined_dataset,
+                train_idx,
+                run_loader=run_loader,
+                use_cache=args.cache,
+            )
+            val_run_dataset = SubjectRunDataset(
+                combined_dataset,
+                val_idx,
+                run_loader=run_loader,
+                use_cache=args.cache,
+            )
             train_run_loader = DataLoader(
                 train_run_dataset,
-                batch_size=1,
+                batch_size=args.run_batch_size,
                 shuffle=True,
                 num_workers=args.num_workers,
                 pin_memory=use_pin,
@@ -802,7 +932,7 @@ def main():
             )
             val_run_loader = DataLoader(
                 val_run_dataset,
-                batch_size=1,
+                batch_size=args.run_batch_size,
                 shuffle=False,
                 num_workers=args.num_workers,
                 pin_memory=use_pin,
@@ -816,7 +946,8 @@ def main():
             epoch_start = time.perf_counter()
             if args.forecast_mode == "long_ar_train":
                 # Linear decay of teacher forcing probability over epochs
-                tf_prob = args.ss_start + (args.ss_end - args.ss_start) * (epoch - 1) / max(args.epochs - 1, 1)
+                # tf_prob = args.ss_start + (args.ss_end - args.ss_start) * (epoch - 1) / max(args.epochs - 1, 1)
+                tf_prob = 0.4
                 train_start = time.perf_counter()
                 train_metrics = run_epoch_ar_train(
                     model=model,
@@ -853,42 +984,47 @@ def main():
                 )
                 train_time_s = time.perf_counter() - train_start
 
-            val_start = time.perf_counter()
-            with torch.no_grad():
-                if args.forecast_mode == "long_ar_train":
-                    val_metrics = run_epoch_ar_train(
-                        model=model,
-                        subject_loader=val_run_loader,
-                        edge_index=edge_index,
-                        dt=args.dt,
-                        x=args.x,
-                        chunk_size=args.ar_chunk_size,
-                        tbptt_chunks=args.tbptt_chunks,
-                        optimizer=None,
-                        lambda_mse=args.lambda_mse,
-                        lambda_mae=args.lambda_mae,
-                        grad_clip=args.grad_clip,
-                        desc=f"fold {fold_idx + 1} val {epoch}/{args.epochs}",
-                        teacher_forcing_prob=0.0,
-                    )
-                else:
-                    val_metrics = run_epoch(
-                        model=model,
-                        loader=val_loader,
-                        edge_index=edge_index,
-                        dt=args.dt,
-                        optimizer=None,
-                        lambda_mse=args.lambda_mse,
-                        lambda_mae=args.lambda_mae,
-                        grad_clip=args.grad_clip,
-                        desc=f"fold {fold_idx + 1} val {epoch}/{args.epochs}",
-                        forecast_mode=args.forecast_mode,
-                        ar_chunk_size=args.ar_chunk_size,
-                    )
-            val_time_s = time.perf_counter() - val_start
+            run_val_this_epoch = (epoch % args.val_every == 0) or (epoch == args.epochs)
+            val_metrics = None
+            val_time_s = 0.0
+            if run_val_this_epoch:
+                val_start = time.perf_counter()
+                with torch.no_grad():
+                    if args.forecast_mode == "long_ar_train":
+                        val_metrics = run_epoch_ar_train(
+                            model=model,
+                            subject_loader=val_run_loader,
+                            edge_index=edge_index,
+                            dt=args.dt,
+                            x=args.x,
+                            chunk_size=args.ar_chunk_size,
+                            tbptt_chunks=args.tbptt_chunks,
+                            optimizer=None,
+                            lambda_mse=args.lambda_mse,
+                            lambda_mae=args.lambda_mae,
+                            grad_clip=args.grad_clip,
+                            desc=f"fold {fold_idx + 1} val {epoch}/{args.epochs}",
+                            teacher_forcing_prob=0.0,
+                        )
+                    else:
+                        val_metrics = run_epoch(
+                            model=model,
+                            loader=val_loader,
+                            edge_index=edge_index,
+                            dt=args.dt,
+                            optimizer=None,
+                            lambda_mse=args.lambda_mse,
+                            lambda_mae=args.lambda_mae,
+                            grad_clip=args.grad_clip,
+                            desc=f"fold {fold_idx + 1} val {epoch}/{args.epochs}",
+                            forecast_mode=args.forecast_mode,
+                            ar_chunk_size=args.ar_chunk_size,
+                        )
+                val_time_s = time.perf_counter() - val_start
 
             prev_lr = optimizer.param_groups[0]["lr"]
-            scheduler.step(val_metrics["total"])
+            if val_metrics is not None:
+                scheduler.step(val_metrics["total"])
             new_lr = optimizer.param_groups[0]["lr"]
             lr_msg = f" | lr={new_lr:.2e}"
             if new_lr < prev_lr:
@@ -896,17 +1032,26 @@ def main():
 
             epoch_time_s = time.perf_counter() - epoch_start
 
-            print(
-                f"Fold {fold_idx + 1}/{args.cv_folds} Epoch {epoch:03d} | "
-                f"train total={train_metrics['total']:.6f} mse={train_metrics['mse']:.6f} mae={train_metrics['mae']:.6f} "
-                f"pcc={train_metrics['pcc']:.4f} scc={train_metrics['scc']:.4f} | "
-                f"val total={val_metrics['total']:.6f} mse={val_metrics['mse']:.6f} mae={val_metrics['mae']:.6f} "
-                f"pcc={val_metrics['pcc']:.4f} scc={val_metrics['scc']:.4f}"
-                f" | t_train={train_time_s:.1f}s t_val={val_time_s:.1f}s t_epoch={epoch_time_s:.1f}s"
-                f"{lr_msg}"
-            )
+            if val_metrics is not None:
+                print(
+                    f"Fold {fold_idx + 1}/{args.cv_folds} Epoch {epoch:03d} | "
+                    f"train total={train_metrics['total']:.6f} mse={train_metrics['mse']:.6f} mae={train_metrics['mae']:.6f} "
+                    f"pcc={train_metrics['pcc']:.4f} scc={train_metrics['scc']:.4f} | "
+                    f"val total={val_metrics['total']:.6f} mse={val_metrics['mse']:.6f} mae={val_metrics['mae']:.6f} "
+                    f"pcc={val_metrics['pcc']:.4f} scc={val_metrics['scc']:.4f}"
+                    f" | t_train={train_time_s:.1f}s t_val={val_time_s:.1f}s t_epoch={epoch_time_s:.1f}s"
+                    f"{lr_msg}"
+                )
+            else:
+                print(
+                    f"Fold {fold_idx + 1}/{args.cv_folds} Epoch {epoch:03d} | "
+                    f"train total={train_metrics['total']:.6f} mse={train_metrics['mse']:.6f} mae={train_metrics['mae']:.6f} "
+                    f"pcc={train_metrics['pcc']:.4f} scc={train_metrics['scc']:.4f}"
+                    f" | t_train={train_time_s:.1f}s t_epoch={epoch_time_s:.1f}s (no val)"
+                    f"{lr_msg}"
+                )
 
-            if val_metrics["total"] < best_val:
+            if val_metrics is not None and val_metrics["total"] < best_val:
                 best_val = val_metrics["total"]
                 torch.save(
                     {
@@ -950,9 +1095,11 @@ def main():
                     dt=args.dt,
                     chunk_steps=args.y,
                     context_len=args.x,
+                    rollout_steps=args.test_rollout_steps,
                     lambda_mse=args.lambda_mse,
                     lambda_mae=args.lambda_mae,
                     desc=f"fold {fold_idx + 1} test-rollout",
+                    run_loader=run_loader,
                 )
             else:
                 test_metrics = run_epoch(

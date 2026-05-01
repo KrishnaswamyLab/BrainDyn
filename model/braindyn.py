@@ -23,6 +23,7 @@ class BrainDynConfig:
     ode_method: str = "rk4"
     use_gat: bool = False
     use_lstm_encoder: bool = True
+    precompute_lap_h: bool = False
 
 
 class BrainDyn(nn.Module):
@@ -38,6 +39,7 @@ class BrainDyn(nn.Module):
         super().__init__()
         self.config = config
         self.ode_method = getattr(config, "ode_method", "rk4")
+        self.precompute_lap_h = getattr(config, "precompute_lap_h", False)
 
         valid_methods = {"rk4", "dopri5", "euler", "midpoint"}
         if self.ode_method not in valid_methods:
@@ -90,9 +92,19 @@ class BrainDyn(nn.Module):
         dt_t = dt if torch.is_tensor(dt) else torch.tensor(dt, dtype=x_history.dtype, device=x_history.device)
         x0 = x_history[:, :, -1, :]
 
-        def rhs(_t: torch.Tensor, x_eval: torch.Tensor) -> torch.Tensor:
-            dxdt, _ = self.dynamics(x_history, edge_index, x_eval=x_eval)
-            return dxdt
+        if self.precompute_lap_h:
+            # Compute history-dependent features once; x_history is constant
+            # for the entire ODE integration so LSTM + graph need only run once
+            # instead of at every RHS evaluation (e.g. 4x per step for rk4).
+            _lap_h, _ = self.dynamics.compute_lap_h(x_history, edge_index)
+
+            def rhs(_t: torch.Tensor, x_eval: torch.Tensor) -> torch.Tensor:
+                dxdt, _ = self.dynamics(x_history, edge_index, x_eval=x_eval, precomputed_lap_h=_lap_h)
+                return dxdt
+        else:
+            def rhs(_t: torch.Tensor, x_eval: torch.Tensor) -> torch.Tensor:
+                dxdt, _ = self.dynamics(x_history, edge_index, x_eval=x_eval)
+                return dxdt
 
         t_eval = torch.arange(pred_steps + 1, device=x_history.device, dtype=x_history.dtype) * dt_t.to(dtype=x_history.dtype)
         x_traj = odeint(rhs, x0, t_eval, method=self.ode_method)
@@ -101,8 +113,9 @@ class BrainDyn(nn.Module):
         out = {"x_pred": x_pred}
         if return_aux:
             aux_seq = []
+            _plh = _lap_h if self.precompute_lap_h else None
             for step_state in x_pred:
-                _, aux = self.dynamics(x_history, edge_index, x_eval=step_state)
+                _, aux = self.dynamics(x_history, edge_index, x_eval=step_state, precomputed_lap_h=_plh)
                 aux_seq.append(aux)
             out["aux_seq"] = aux_seq
         return out

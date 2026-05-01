@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 
 try:
-    from torch_geometric.nn import GATConv
+    from torch_geometric.nn import GCNConv
 except ImportError:  # pragma: no cover - runtime guard for optional dependency
-    GATConv = None
+    GCNConv = None
 
 
 class SheafLaplacian(nn.Module):
@@ -96,23 +96,20 @@ class SheafLaplacian(nn.Module):
 
 
 class GATAggregator(nn.Module):
-    """GAT neighborhood aggregation implemented with PyG GATConv."""
+    """GCN neighborhood aggregation implemented with PyG GCNConv."""
 
     def __init__(self, hidden_dim: int, num_nodes: int):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_nodes = num_nodes
-        if GATConv is None:
+        if GCNConv is None:
             raise ImportError(
-                "GAT ablation requires torch-geometric. Install it with: pip install torch-geometric"
+                "GCN ablation requires torch-geometric. Install it with: pip install torch-geometric"
             )
-        self.gat = GATConv(
+        self.gat = GCNConv(
             in_channels=hidden_dim,
             out_channels=hidden_dim,
-            heads=1,
-            concat=False,
             add_self_loops=False,
-            dropout=0.0,
             bias=True,
         )
 
@@ -137,6 +134,6 @@ class GATAggregator(nn.Module):
         agg = torch.stack(batch_outputs, dim=0)
 
         aux = {
-            "graph_mode": "gat",
+            "graph_mode": "gcn",
         }
         return agg, aux
