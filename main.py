@@ -639,10 +639,10 @@ def parse_args():
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
 
-    ap.add_argument("--hidden_dim", type=int, default=128) #I had changed this from 64 to 128 
+    ap.add_argument("--hidden_dim", type=int, default=64) #I had changed this from 64 to 128 
     ap.add_argument("--lstm_layers", type=int, default=1)
     ap.add_argument("--lstm_dropout", type=float, default=0.0)
-    ap.add_argument("--map_hidden_dim", type=int, default=64) #I had changed this from 16 to 64
+    ap.add_argument("--map_hidden_dim", type=int, default=16) #I had changed this from 16 to 64
     ap.add_argument("--vf_hidden_dim", type=int, default=128)
 
     ap.add_argument("--lambda_mse", type=float, default=1.0)
