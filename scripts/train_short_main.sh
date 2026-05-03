@@ -23,7 +23,6 @@ uv run main.py \
   --y 10 \
   --forecast_mode short \
   --amp \
-  --no_pin_memory \
   --lr 1e-3 \
   --lr_patience 3 \
   --lr_factor 0.5 \

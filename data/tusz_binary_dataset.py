@@ -50,10 +50,14 @@ class TUSZBinaryDataset(Dataset):
         split: Split = "train",
         zscore: bool = True,
         eps: float = 1e-6,
+        cache: bool = True,
     ) -> None:
         self.h5_path = Path(h5_path)
         self.zscore = zscore
         self.eps = eps
+        self.cache = cache
+        self._x_cache: Optional[np.ndarray] = None
+        self._y_cache: Optional[np.ndarray] = None
 
         want = _MANIFEST_SPLIT[split]
         rows = [r for r in _read_manifest(Path(manifest_csv)) if r["split"] == want]
@@ -70,13 +74,29 @@ class TUSZBinaryDataset(Dataset):
     def __len__(self) -> int:
         return len(self._rows)
 
+    def _get_x_cache(self) -> np.ndarray:
+        if self._x_cache is None:
+            with h5py.File(self.h5_path, "r") as hf:
+                self._x_cache = hf["x"][:].astype(np.float32)
+        return self._x_cache
+
+    def _get_y_cache(self) -> np.ndarray:
+        if self._y_cache is None:
+            with h5py.File(self.h5_path, "r") as hf:
+                self._y_cache = hf["y"][:]
+        return self._y_cache
+
     def __getitem__(self, idx: int) -> dict:
         row = self._rows[idx]
         wid = self._window_ids[idx]
 
-        with h5py.File(self.h5_path, "r") as hf:
-            x = np.asarray(hf["x"][wid], dtype=np.float32)
-            y = int(hf["y"][wid])
+        if self.cache:
+            x = self._get_x_cache()[wid].copy()
+            y = int(self._get_y_cache()[wid])
+        else:
+            with h5py.File(self.h5_path, "r") as hf:
+                x = np.asarray(hf["x"][wid], dtype=np.float32)
+                y = int(hf["y"][wid])
 
         if self.zscore:
             m = x.mean(axis=1, keepdims=True)
@@ -105,9 +125,10 @@ def make_binary_dataloader(
     num_workers: int = 0,
     zscore: bool = True,
     eps: float = 1e-6,
+    cache: bool = False,
     **loader_kw,
 ) -> DataLoader:
-    ds = TUSZBinaryDataset(h5_path, manifest_csv, split=split, zscore=zscore, eps=eps)
+    ds = TUSZBinaryDataset(h5_path, manifest_csv, split=split, zscore=zscore, eps=eps, cache=cache)
     return DataLoader(
         ds,
         batch_size=batch_size,

@@ -129,7 +129,7 @@ class RBCDataset(Dataset):
         stride: int = 1,
         cohort: Optional[str] = None,
         min_t: int = 0,
-        cache: bool = False,
+        cache: bool = True,
     ) -> None:
         if split not in (_BETWEEN_SPLITS | {"within"}):
             raise ValueError(

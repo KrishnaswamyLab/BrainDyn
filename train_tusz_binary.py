@@ -594,6 +594,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--num_workers", type=int, default=4, help="Number of worker processes for data loading.")
     ap.add_argument("--no_pin_memory", action="store_true")
+    ap.add_argument("--cache", action="store_true", help="Load full HDF5 arrays into RAM on first access (faster after warmup).")
     ap.add_argument("--subset_train_windows", type=int, default=10000, help="Smart-subset train split to this many windows.")
     ap.add_argument("--subset_eval_windows", type=int, default=2500, help="Smart-subset val/test splits to this many windows each.")
     ap.add_argument("--cv_folds", type=int, default=5, help="number of train/val cross-validation folds over train+val.")
@@ -658,6 +659,7 @@ def main() -> None:
         pin_memory=(not args.no_pin_memory),
         zscore=args.zscore,
         eps=args.eps,
+        cache=args.cache,
     )
     val_loader = make_binary_dataloader(
         h5_path=h5_path,
@@ -669,6 +671,7 @@ def main() -> None:
         pin_memory=(not args.no_pin_memory),
         zscore=args.zscore,
         eps=args.eps,
+        cache=args.cache,
     )
     test_loader = make_binary_dataloader(
         h5_path=h5_path,
@@ -680,6 +683,7 @@ def main() -> None:
         pin_memory=(not args.no_pin_memory),
         zscore=args.zscore,
         eps=args.eps,
+        cache=args.cache,
     )
 
     train_loader = maybe_subset_loader(
