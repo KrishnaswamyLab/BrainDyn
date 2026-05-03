@@ -10,13 +10,13 @@ import h5py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.stats import pearsonr
-from torch.utils.data import DataLoader, Subset
+from scipy.stats import pearsonr, spearmanr
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 from tqdm import tqdm
 
 from data.tusz_binary_dataset import make_binary_dataloader
 from model.braindyn import BrainDyn, BrainDynConfig
-from model.losses import total_loss
+from model.losses import dtw_mean_normalized, total_loss
 
 
 def set_seed(seed: int) -> None:
@@ -111,6 +111,8 @@ def run_forecasting_epoch(
     mse_running = 0.0
     mae_running = 0.0
     pcc_running = 0.0
+    scc_running = 0.0
+    dtw_running = 0.0
     n_batches = 0
 
     pbar = tqdm(loader, desc=desc, leave=False)
@@ -152,10 +154,13 @@ def run_forecasting_epoch(
         mse_running += float(losses["mse"].detach().cpu())
         mae_running += float(losses["mae"].detach().cpu())
 
-        y_pred_np = y_pred.detach().cpu().numpy().ravel()
-        y_true_np = y_true.detach().cpu().numpy().ravel()
-        pcc_val = float(pearsonr(y_pred_np, y_true_np).statistic)
+        y_pred_np = y_pred.detach().cpu().numpy()
+        y_true_np = y_true.detach().cpu().numpy()
+        pcc_val = float(pearsonr(y_pred_np.ravel(), y_true_np.ravel()).statistic)
+        scc_val = float(spearmanr(y_pred_np.ravel(), y_true_np.ravel()).statistic)
         pcc_running += pcc_val
+        scc_running += scc_val
+        dtw_running += dtw_mean_normalized(y_pred_np, y_true_np)
         n_batches += 1
 
         pbar.set_postfix(
@@ -163,18 +168,63 @@ def run_forecasting_epoch(
                 "total": f"{total_running / n_batches:.4f}",
                 "mse": f"{mse_running / n_batches:.4f}",
                 "pcc": f"{pcc_running / n_batches:.4f}",
+                "scc": f"{scc_running / n_batches:.4f}",
+                "dtw": f"{dtw_running / n_batches:.4f}",
             }
         )
 
     if n_batches == 0:
-        return {"total": float("nan"), "mse": float("nan"), "mae": float("nan"), "pcc": float("nan")}
+        return {
+            "total": float("nan"),
+            "mse": float("nan"),
+            "mae": float("nan"),
+            "pcc": float("nan"),
+            "scc": float("nan"),
+            "dtw": float("nan"),
+        }
 
     return {
         "total": total_running / n_batches,
         "mse": mse_running / n_batches,
         "mae": mae_running / n_batches,
         "pcc": pcc_running / n_batches,
+        "scc": scc_running / n_batches,
+        "dtw": dtw_running / n_batches,
     }
+
+
+def binary_auc_roc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Compute ROC AUC for binary labels without external dependencies.
+
+    Returns NaN if only one class is present.
+    """
+    y_true = np.asarray(y_true).astype(np.int64)
+    y_score = np.asarray(y_score).astype(np.float64)
+
+    pos = int((y_true == 1).sum())
+    neg = int((y_true == 0).sum())
+    if pos == 0 or neg == 0:
+        return float("nan")
+
+    order = np.argsort(y_score)
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(1, len(y_score) + 1, dtype=np.float64)
+
+    # Average ranks for ties
+    sorted_scores = y_score[order]
+    i = 0
+    while i < len(sorted_scores):
+        j = i + 1
+        while j < len(sorted_scores) and sorted_scores[j] == sorted_scores[i]:
+            j += 1
+        if j - i > 1:
+            avg_rank = ranks[order[i:j]].mean()
+            ranks[order[i:j]] = avg_rank
+        i = j
+
+    sum_ranks_pos = float(ranks[y_true == 1].sum())
+    auc = (sum_ranks_pos - pos * (pos + 1) / 2.0) / (pos * neg)
+    return float(auc)
 
 
 class DynamicsBinaryHead(nn.Module):
@@ -234,6 +284,8 @@ def run_binary_classification_epoch(
     running_correct = 0
     running_total = 0
     tp = tn = fp = fn = 0
+    score_accum: list[np.ndarray] = []
+    label_accum: list[np.ndarray] = []
 
     if pos_weight is not None:
         pos_weight_t = torch.tensor([pos_weight], dtype=torch.float32, device=edge_index.device)
@@ -290,6 +342,9 @@ def run_binary_classification_epoch(
         fp += int(((preds == 1.0) & (labels == 0.0)).sum().item())
         fn += int(((preds == 0.0) & (labels == 1.0)).sum().item())
 
+        score_accum.append(probs.detach().cpu().numpy().ravel())
+        label_accum.append(labels.detach().cpu().numpy().ravel())
+
         pbar.set_postfix(
             {
                 "loss": f"{running_loss / max(len(loader), 1):.4f}",
@@ -304,11 +359,15 @@ def run_binary_classification_epoch(
             "precision": float("nan"),
             "recall": float("nan"),
             "f1": float("nan"),
+            "aucroc": float("nan"),
         }
 
     precision = tp / (tp + fp + 1e-12)
     recall = tp / (tp + fn + 1e-12)
     f1 = 2.0 * precision * recall / (precision + recall + 1e-12)
+    y_score = np.concatenate(score_accum) if score_accum else np.array([], dtype=np.float64)
+    y_true = np.concatenate(label_accum) if label_accum else np.array([], dtype=np.int64)
+    aucroc = binary_auc_roc(y_true=y_true, y_score=y_score) if y_score.size > 0 else float("nan")
 
     return {
         "loss": running_loss / max(len(loader), 1),
@@ -316,6 +375,7 @@ def run_binary_classification_epoch(
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
+        "aucroc": float(aucroc),
     }
 
 
@@ -500,6 +560,26 @@ def maybe_subset_loader(
     return sub_loader
 
 
+def make_subset_loader(
+    dataset,
+    indices: np.ndarray,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    shuffle: bool,
+    collate_fn,
+) -> DataLoader:
+    return DataLoader(
+        Subset(dataset, list(indices)),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn,
+        persistent_workers=(num_workers > 0),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Train BrainDyn on binary TUSZ windows with short-horizon forecasting and downstream seizure-vs-normal classification.",
@@ -512,15 +592,16 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--zscore", action="store_true", help="Apply per-window z-score from binary dataloader.")
     ap.add_argument("--eps", type=float, default=1e-2, help="z-score std floor when --zscore is enabled.")
     ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--num_workers", type=int, default=0, help="Keep 0 unless worker-safe HDF5 handles are implemented.")
+    ap.add_argument("--num_workers", type=int, default=4, help="Number of worker processes for data loading.")
     ap.add_argument("--no_pin_memory", action="store_true")
-    ap.add_argument("--subset_train_windows", type=int, default=None, help="Smart-subset train split to this many windows.")
-    ap.add_argument("--subset_eval_windows", type=int, default=None, help="Smart-subset val/test splits to this many windows each.")
+    ap.add_argument("--subset_train_windows", type=int, default=10000, help="Smart-subset train split to this many windows.")
+    ap.add_argument("--subset_eval_windows", type=int, default=2500, help="Smart-subset val/test splits to this many windows each.")
+    ap.add_argument("--cv_folds", type=int, default=5, help="number of train/val cross-validation folds over train+val.")
 
-    ap.add_argument("--hidden_dim", type=int, default=64)
+    ap.add_argument("--hidden_dim", type=int, default=128)
     ap.add_argument("--lstm_layers", type=int, default=1)
     ap.add_argument("--lstm_dropout", type=float, default=0.0)
-    ap.add_argument("--map_hidden_dim", type=int, default=16)
+    ap.add_argument("--map_hidden_dim", type=int, default=64)
     ap.add_argument("--vf_hidden_dim", type=int, default=128)
     ap.add_argument("--ode_method", type=str, default="rk4", choices=["rk4", "dopri5", "euler", "midpoint"])
     ap.add_argument("--dt", type=float, default=1.0)
@@ -531,8 +612,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fc_threshold", type=float, default=0.3)
     ap.add_argument("--fc_max_batches", type=int, default=30)
 
-    ap.add_argument("--epochs_forecast", type=int, default=50)
-    ap.add_argument("--epochs_cls", type=int, default=30)
+    ap.add_argument("--epochs_forecast", type=int, default=100)
+    ap.add_argument("--epochs_cls", type=int, default=50)
     ap.add_argument("--lr_forecast", type=float, default=3e-4)
     ap.add_argument("--lr_cls_head", type=float, default=1e-3)
     ap.add_argument("--lr_cls_backbone", type=float, default=1e-5)
@@ -623,66 +704,160 @@ def main() -> None:
         split_name="test",
     )
 
-    edge_index, corr = build_fc_graph_binary(
-        loader=train_loader,
-        x_len=args.x_len,
-        max_batches=args.fc_max_batches,
-        threshold=args.fc_threshold,
-    )
-    edge_index = edge_index.to(device)
-    n_edges = edge_index.shape[1]
-    density = n_edges / (19 * 18)
-    print(f"FC graph: {n_edges} directed edges | density={density:.3f} | threshold={args.fc_threshold:.3f}")
-    print(f"FC abs(corr) mean={corr.abs().mean().item():.3f}, max={corr.abs().max().item():.3f}")
-
-    model_cfg = BrainDynConfig(
-        signal_dim=1,
-        hidden_dim=args.hidden_dim,
-        num_nodes=19,
-        window_size=args.x_len,
-        lstm_layers=args.lstm_layers,
-        lstm_dropout=args.lstm_dropout,
-        map_hidden_dim=args.map_hidden_dim,
-        vf_hidden_dim=args.vf_hidden_dim,
-        ode_method=args.ode_method,
-        use_gat=args.ablation_gat,
-        use_lstm_encoder=(not args.ablation_no_lstm),
-        precompute_lap_h=args.precompute_lap_h,
-    )
-    model = BrainDyn(model_cfg).to(device)
-
-    print("\n=== Stage 1: Forecasting pre-training (binary windows) ===")
-    optimizer_forecast = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr_forecast,
-        weight_decay=args.weight_decay,
-    )
-    scheduler_forecast = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_forecast,
-        mode="min",
-        factor=0.5,
-        patience=3,
-        min_lr=1e-6,
-    )
-
-    best_val_forecast = float("inf")
-    for epoch in range(1, args.epochs_forecast + 1):
-        train_metrics = run_forecasting_epoch(
-            model=model,
-            loader=train_loader,
-            edge_index=edge_index,
-            x_len=args.x_len,
-            dt=args.dt,
-            optimizer=optimizer_forecast,
-            lambda_mse=args.lambda_mse,
-            lambda_mae=args.lambda_mae,
-            grad_clip=args.grad_clip,
-            use_amp=args.amp,
-            desc=f"forecast train [{epoch}/{args.epochs_forecast}]",
+    combined_dataset = ConcatDataset([train_loader.dataset, val_loader.dataset])
+    if args.cv_folds < 2:
+        raise ValueError(f"cv_folds must be >= 2, got {args.cv_folds}")
+    if len(combined_dataset) < args.cv_folds:
+        raise ValueError(
+            f"Not enough combined train+val samples ({len(combined_dataset)}) for {args.cv_folds}-fold CV"
         )
-        val_metrics = run_forecasting_epoch(
+
+    rng = np.random.default_rng(args.seed)
+    all_indices = np.arange(len(combined_dataset))
+    rng.shuffle(all_indices)
+    fold_indices = np.array_split(all_indices, args.cv_folds)
+
+    forecast_base_path = Path(args.save_forecast_path)
+    classifier_base_path = Path(args.save_classifier_path)
+    forecast_base_path.parent.mkdir(parents=True, exist_ok=True)
+    classifier_base_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fold_forecast_val_metrics: list[dict[str, float]] = []
+    fold_forecast_test_metrics: list[dict[str, float]] = []
+    fold_cls_val_metrics: list[dict[str, float]] = []
+    fold_cls_test_metrics: list[dict[str, float]] = []
+
+    print(f"\n=== {args.cv_folds}-Fold CV over train+val (binary TUSZ) ===")
+    print(f"Combined CV pool: {len(combined_dataset)} windows | Held-out test: {len(test_loader.dataset)} windows")
+
+    for fold_idx in range(args.cv_folds):
+        val_idx = fold_indices[fold_idx]
+        train_idx = np.concatenate([fold_indices[i] for i in range(args.cv_folds) if i != fold_idx])
+
+        fold_train_loader = make_subset_loader(
+            dataset=combined_dataset,
+            indices=train_idx,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=(not args.no_pin_memory),
+            shuffle=True,
+            collate_fn=train_loader.collate_fn,
+        )
+        fold_val_loader = make_subset_loader(
+            dataset=combined_dataset,
+            indices=val_idx,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=(not args.no_pin_memory),
+            shuffle=False,
+            collate_fn=train_loader.collate_fn,
+        )
+
+        edge_index, corr = build_fc_graph_binary(
+            loader=fold_train_loader,
+            x_len=args.x_len,
+            max_batches=args.fc_max_batches,
+            threshold=args.fc_threshold,
+        )
+        edge_index = edge_index.to(device)
+        n_edges = edge_index.shape[1]
+        density = n_edges / (19 * 18)
+        print(
+            f"Fold {fold_idx + 1}/{args.cv_folds} | FC graph: E={n_edges}, density={density:.3f}, "
+            f"|corr| mean={corr.abs().mean().item():.3f}, max={corr.abs().max().item():.3f}"
+        )
+
+        model_cfg = BrainDynConfig(
+            signal_dim=1,
+            hidden_dim=args.hidden_dim,
+            num_nodes=19,
+            window_size=args.x_len,
+            lstm_layers=args.lstm_layers,
+            lstm_dropout=args.lstm_dropout,
+            map_hidden_dim=args.map_hidden_dim,
+            vf_hidden_dim=args.vf_hidden_dim,
+            ode_method=args.ode_method,
+            use_gat=args.ablation_gat,
+            use_lstm_encoder=(not args.ablation_no_lstm),
+            precompute_lap_h=args.precompute_lap_h,
+        )
+        model = BrainDyn(model_cfg).to(device)
+
+        print(f"\nFold {fold_idx + 1}/{args.cv_folds} | Stage 1: Forecasting")
+        optimizer_forecast = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr_forecast,
+            weight_decay=args.weight_decay,
+        )
+        scheduler_forecast = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer_forecast,
+            mode="min",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+        )
+
+        fold_forecast_path = forecast_base_path.with_name(
+            f"{forecast_base_path.stem}_fold{fold_idx + 1}{forecast_base_path.suffix}"
+        )
+        best_val_forecast = float("inf")
+        for epoch in range(1, args.epochs_forecast + 1):
+            train_metrics = run_forecasting_epoch(
+                model=model,
+                loader=fold_train_loader,
+                edge_index=edge_index,
+                x_len=args.x_len,
+                dt=args.dt,
+                optimizer=optimizer_forecast,
+                lambda_mse=args.lambda_mse,
+                lambda_mae=args.lambda_mae,
+                grad_clip=args.grad_clip,
+                use_amp=args.amp,
+                desc=f"fold {fold_idx + 1} forecast train [{epoch}/{args.epochs_forecast}]",
+            )
+            val_metrics = run_forecasting_epoch(
+                model=model,
+                loader=fold_val_loader,
+                edge_index=edge_index,
+                x_len=args.x_len,
+                dt=args.dt,
+                optimizer=None,
+                lambda_mse=args.lambda_mse,
+                lambda_mae=args.lambda_mae,
+                grad_clip=args.grad_clip,
+                use_amp=args.amp,
+                desc=f"fold {fold_idx + 1} forecast val   [{epoch}/{args.epochs_forecast}]",
+            )
+            scheduler_forecast.step(val_metrics["total"])
+
+            print(
+                f"Fold {fold_idx + 1}/{args.cv_folds} Epoch {epoch:03d} | "
+                f"train total={train_metrics['total']:.4f} mse={train_metrics['mse']:.4f} mae={train_metrics['mae']:.4f} "
+                f"pcc={train_metrics['pcc']:.4f} scc={train_metrics['scc']:.4f} | "
+                f"val total={val_metrics['total']:.4f} mse={val_metrics['mse']:.4f} mae={val_metrics['mae']:.4f} "
+                f"pcc={val_metrics['pcc']:.4f} scc={val_metrics['scc']:.4f}"
+            )
+
+            if val_metrics["total"] < best_val_forecast:
+                best_val_forecast = val_metrics["total"]
+                torch.save(
+                    {
+                        "stage": "forecasting",
+                        "fold": fold_idx + 1,
+                        "model_state": model.state_dict(),
+                        "edge_index": edge_index.detach().cpu(),
+                        "args": vars(args),
+                        "val_metrics": val_metrics,
+                    },
+                    fold_forecast_path,
+                )
+
+        ckpt_forecast = torch.load(fold_forecast_path, map_location=device)
+        model.load_state_dict(ckpt_forecast["model_state"])
+
+        val_forecast = run_forecasting_epoch(
             model=model,
-            loader=val_loader,
+            loader=fold_val_loader,
             edge_index=edge_index,
             x_len=args.x_len,
             dt=args.dt,
@@ -691,162 +866,194 @@ def main() -> None:
             lambda_mae=args.lambda_mae,
             grad_clip=args.grad_clip,
             use_amp=args.amp,
-            desc=f"forecast val   [{epoch}/{args.epochs_forecast}]",
+            desc=f"fold {fold_idx + 1} forecast best-val",
         )
-        scheduler_forecast.step(val_metrics["total"])
-
-        print(
-            f"Epoch {epoch:03d} | "
-            f"train total={train_metrics['total']:.4f} mse={train_metrics['mse']:.4f} pcc={train_metrics['pcc']:.4f} | "
-            f"val total={val_metrics['total']:.4f} mse={val_metrics['mse']:.4f} pcc={val_metrics['pcc']:.4f}"
-        )
-
-        if val_metrics["total"] < best_val_forecast:
-            best_val_forecast = val_metrics["total"]
-            save_path = Path(args.save_forecast_path)
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "stage": "forecasting",
-                    "model_state": model.state_dict(),
-                    "edge_index": edge_index.detach().cpu(),
-                    "args": vars(args),
-                    "val_metrics": val_metrics,
-                },
-                save_path,
-            )
-            print(f"Saved best forecasting checkpoint -> {save_path}")
-
-    test_forecast = run_forecasting_epoch(
-        model=model,
-        loader=test_loader,
-        edge_index=edge_index,
-        x_len=args.x_len,
-        dt=args.dt,
-        optimizer=None,
-        lambda_mse=args.lambda_mse,
-        lambda_mae=args.lambda_mae,
-        grad_clip=args.grad_clip,
-        use_amp=args.amp,
-        desc="forecast test",
-    )
-    print(
-        f"Forecast test | total={test_forecast['total']:.4f} "
-        f"mse={test_forecast['mse']:.4f} mae={test_forecast['mae']:.4f} pcc={test_forecast['pcc']:.4f}"
-    )
-
-    print("\n=== Stage 2: Binary dynamics classification (normal vs seizure) ===")
-    classifier = DynamicsBinaryHead(hidden_dim=args.hidden_dim, dropout=args.cls_dropout).to(device)
-
-    freeze_module(model, args.freeze_backbone)
-
-    if args.freeze_backbone:
-        cls_params = list(classifier.parameters())
-        print("Classification mode: frozen BrainDyn backbone; training classifier head only.")
-    else:
-        cls_params = [
-            {"params": [p for p in classifier.parameters() if p.requires_grad], "lr": args.lr_cls_head},
-            {"params": [p for p in model.parameters() if p.requires_grad], "lr": args.lr_cls_backbone},
-        ]
-        print("Classification mode: fine-tuning backbone + classifier head.")
-
-    if args.freeze_backbone:
-        optimizer_cls = torch.optim.AdamW(
-            cls_params,
-            lr=args.lr_cls_head,
-            weight_decay=args.weight_decay,
-        )
-    else:
-        optimizer_cls = torch.optim.AdamW(
-            cls_params,
-            weight_decay=args.weight_decay,
-        )
-
-    scheduler_cls = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_cls,
-        mode="max",
-        factor=0.5,
-        patience=3,
-        min_lr=1e-6,
-    )
-
-    pos_weight = estimate_pos_weight(train_loader) if args.use_pos_weight else None
-    if pos_weight is not None:
-        print(f"Using BCE pos_weight={pos_weight:.4f}")
-
-    best_val_f1 = -1.0
-    for epoch in range(1, args.epochs_cls + 1):
-        train_cls = run_binary_classification_epoch(
+        test_forecast = run_forecasting_epoch(
             model=model,
-            classifier=classifier,
-            loader=train_loader,
+            loader=test_loader,
             edge_index=edge_index,
             x_len=args.x_len,
-            rep_source=args.rep_source,
-            optimizer=optimizer_cls,
-            use_amp=args.amp,
+            dt=args.dt,
+            optimizer=None,
+            lambda_mse=args.lambda_mse,
+            lambda_mae=args.lambda_mae,
             grad_clip=args.grad_clip,
-            desc=f"cls train [{epoch}/{args.epochs_cls}]",
-            pos_weight=pos_weight,
+            use_amp=args.amp,
+            desc=f"fold {fold_idx + 1} forecast test",
         )
-        val_cls = run_binary_classification_epoch(
+        print(
+            f"Fold {fold_idx + 1}/{args.cv_folds} Forecast | "
+            f"val mse={val_forecast['mse']:.4f} mae={val_forecast['mae']:.4f} "
+            f"pcc={val_forecast['pcc']:.4f} scc={val_forecast['scc']:.4f} | "
+            f"test mse={test_forecast['mse']:.4f} mae={test_forecast['mae']:.4f} "
+            f"pcc={test_forecast['pcc']:.4f} scc={test_forecast['scc']:.4f}"
+        )
+
+        fold_forecast_val_metrics.append(val_forecast)
+        fold_forecast_test_metrics.append(test_forecast)
+
+        print(f"\nFold {fold_idx + 1}/{args.cv_folds} | Stage 2: Binary classification")
+        classifier = DynamicsBinaryHead(hidden_dim=args.hidden_dim, dropout=args.cls_dropout).to(device)
+        freeze_module(model, args.freeze_backbone)
+
+        if args.freeze_backbone:
+            cls_params = list(classifier.parameters())
+            print("Classification mode: frozen BrainDyn backbone; training classifier head only.")
+        else:
+            cls_params = [
+                {"params": [p for p in classifier.parameters() if p.requires_grad], "lr": args.lr_cls_head},
+                {"params": [p for p in model.parameters() if p.requires_grad], "lr": args.lr_cls_backbone},
+            ]
+            print("Classification mode: fine-tuning backbone + classifier head.")
+
+        if args.freeze_backbone:
+            optimizer_cls = torch.optim.AdamW(
+                cls_params,
+                lr=args.lr_cls_head,
+                weight_decay=args.weight_decay,
+            )
+        else:
+            optimizer_cls = torch.optim.AdamW(
+                cls_params,
+                weight_decay=args.weight_decay,
+            )
+
+        scheduler_cls = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer_cls,
+            mode="max",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+        )
+
+        pos_weight = estimate_pos_weight(fold_train_loader) if args.use_pos_weight else None
+        if pos_weight is not None:
+            print(f"Fold {fold_idx + 1}/{args.cv_folds} BCE pos_weight={pos_weight:.4f}")
+
+        fold_classifier_path = classifier_base_path.with_name(
+            f"{classifier_base_path.stem}_fold{fold_idx + 1}{classifier_base_path.suffix}"
+        )
+        best_val_f1 = -1.0
+        for epoch in range(1, args.epochs_cls + 1):
+            train_cls = run_binary_classification_epoch(
+                model=model,
+                classifier=classifier,
+                loader=fold_train_loader,
+                edge_index=edge_index,
+                x_len=args.x_len,
+                rep_source=args.rep_source,
+                optimizer=optimizer_cls,
+                use_amp=args.amp,
+                grad_clip=args.grad_clip,
+                desc=f"fold {fold_idx + 1} cls train [{epoch}/{args.epochs_cls}]",
+                pos_weight=pos_weight,
+            )
+            val_cls = run_binary_classification_epoch(
+                model=model,
+                classifier=classifier,
+                loader=fold_val_loader,
+                edge_index=edge_index,
+                x_len=args.x_len,
+                rep_source=args.rep_source,
+                optimizer=None,
+                use_amp=args.amp,
+                grad_clip=args.grad_clip,
+                desc=f"fold {fold_idx + 1} cls val   [{epoch}/{args.epochs_cls}]",
+                pos_weight=pos_weight,
+            )
+            scheduler_cls.step(val_cls["f1"])
+
+            print(
+                f"Fold {fold_idx + 1}/{args.cv_folds} Epoch {epoch:03d} | "
+                f"train loss={train_cls['loss']:.4f} acc={train_cls['acc']:.4f} precision={train_cls['precision']:.4f} "
+                f"recall={train_cls['recall']:.4f} f1={train_cls['f1']:.4f} aucroc={train_cls['aucroc']:.4f} | "
+                f"val loss={val_cls['loss']:.4f} acc={val_cls['acc']:.4f} precision={val_cls['precision']:.4f} "
+                f"recall={val_cls['recall']:.4f} f1={val_cls['f1']:.4f} aucroc={val_cls['aucroc']:.4f}"
+            )
+
+            if val_cls["f1"] > best_val_f1:
+                best_val_f1 = val_cls["f1"]
+                torch.save(
+                    {
+                        "stage": "classification",
+                        "fold": fold_idx + 1,
+                        "model_state": model.state_dict(),
+                        "classifier_state": classifier.state_dict(),
+                        "edge_index": edge_index.detach().cpu(),
+                        "args": vars(args),
+                        "val_metrics": val_cls,
+                        "label_mapping": {0: "normal", 1: "seizure"},
+                    },
+                    fold_classifier_path,
+                )
+
+        ckpt_cls = torch.load(fold_classifier_path, map_location=device)
+        model.load_state_dict(ckpt_cls["model_state"])
+        classifier.load_state_dict(ckpt_cls["classifier_state"])
+
+        val_cls_best = run_binary_classification_epoch(
             model=model,
             classifier=classifier,
-            loader=val_loader,
+            loader=fold_val_loader,
             edge_index=edge_index,
             x_len=args.x_len,
             rep_source=args.rep_source,
             optimizer=None,
             use_amp=args.amp,
             grad_clip=args.grad_clip,
-            desc=f"cls val   [{epoch}/{args.epochs_cls}]",
+            desc=f"fold {fold_idx + 1} cls best-val",
             pos_weight=pos_weight,
         )
-        scheduler_cls.step(val_cls["f1"])
-
+        test_cls = run_binary_classification_epoch(
+            model=model,
+            classifier=classifier,
+            loader=test_loader,
+            edge_index=edge_index,
+            x_len=args.x_len,
+            rep_source=args.rep_source,
+            optimizer=None,
+            use_amp=args.amp,
+            grad_clip=args.grad_clip,
+            desc=f"fold {fold_idx + 1} cls test",
+            pos_weight=pos_weight,
+        )
         print(
-            f"Epoch {epoch:03d} | "
-            f"train loss={train_cls['loss']:.4f} acc={train_cls['acc']:.4f} precision={train_cls['precision']:.4f} "
-            f"recall={train_cls['recall']:.4f} f1={train_cls['f1']:.4f} | "
-            f"val loss={val_cls['loss']:.4f} acc={val_cls['acc']:.4f} precision={val_cls['precision']:.4f} "
-            f"recall={val_cls['recall']:.4f} f1={val_cls['f1']:.4f}"
+            f"Fold {fold_idx + 1}/{args.cv_folds} Classification | "
+            f"val acc={val_cls_best['acc']:.4f} f1={val_cls_best['f1']:.4f} aucroc={val_cls_best['aucroc']:.4f} | "
+            f"test acc={test_cls['acc']:.4f} f1={test_cls['f1']:.4f} aucroc={test_cls['aucroc']:.4f}"
         )
 
-        if val_cls["f1"] > best_val_f1:
-            best_val_f1 = val_cls["f1"]
-            save_path = Path(args.save_classifier_path)
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "stage": "classification",
-                    "model_state": model.state_dict(),
-                    "classifier_state": classifier.state_dict(),
-                    "edge_index": edge_index.detach().cpu(),
-                    "args": vars(args),
-                    "val_metrics": val_cls,
-                    "label_mapping": {0: "normal", 1: "seizure"},
-                },
-                save_path,
-            )
-            print(f"Saved best classifier checkpoint -> {save_path}")
+        fold_cls_val_metrics.append(val_cls_best)
+        fold_cls_test_metrics.append(test_cls)
 
-    test_cls = run_binary_classification_epoch(
-        model=model,
-        classifier=classifier,
-        loader=test_loader,
-        edge_index=edge_index,
-        x_len=args.x_len,
-        rep_source=args.rep_source,
-        optimizer=None,
-        use_amp=args.amp,
-        grad_clip=args.grad_clip,
-        desc="cls test",
-        pos_weight=pos_weight,
-    )
-    print(
-        f"Classification test | loss={test_cls['loss']:.4f} acc={test_cls['acc']:.4f} "
-        f"precision={test_cls['precision']:.4f} recall={test_cls['recall']:.4f} f1={test_cls['f1']:.4f}"
-    )
+    def _ms(metrics_list: list[dict[str, float]], key: str) -> tuple[float, float]:
+        vals = np.asarray([m[key] for m in metrics_list], dtype=np.float64)
+        return float(np.nanmean(vals)), float(np.nanstd(vals))
+
+    print("\n=== CV Summary ===")
+    print("\nForecasting Val (mean +- std across folds):")
+    print(f"  MSE   : {_ms(fold_forecast_val_metrics, 'mse')[0]:.6f} +- {_ms(fold_forecast_val_metrics, 'mse')[1]:.6f}")
+    print(f"  MAE   : {_ms(fold_forecast_val_metrics, 'mae')[0]:.6f} +- {_ms(fold_forecast_val_metrics, 'mae')[1]:.6f}")
+    print(f"  PCC   : {_ms(fold_forecast_val_metrics, 'pcc')[0]:.4f} +- {_ms(fold_forecast_val_metrics, 'pcc')[1]:.4f}")
+    print(f"  SCC   : {_ms(fold_forecast_val_metrics, 'scc')[0]:.4f} +- {_ms(fold_forecast_val_metrics, 'scc')[1]:.4f}")
+    print(f"  DTW   : {_ms(fold_forecast_val_metrics, 'dtw')[0]:.6f} +- {_ms(fold_forecast_val_metrics, 'dtw')[1]:.6f}")
+
+    print("\nForecasting Test (mean +- std across folds):")
+    print(f"  MSE   : {_ms(fold_forecast_test_metrics, 'mse')[0]:.6f} +- {_ms(fold_forecast_test_metrics, 'mse')[1]:.6f}")
+    print(f"  MAE   : {_ms(fold_forecast_test_metrics, 'mae')[0]:.6f} +- {_ms(fold_forecast_test_metrics, 'mae')[1]:.6f}")
+    print(f"  PCC   : {_ms(fold_forecast_test_metrics, 'pcc')[0]:.4f} +- {_ms(fold_forecast_test_metrics, 'pcc')[1]:.4f}")
+    print(f"  SCC   : {_ms(fold_forecast_test_metrics, 'scc')[0]:.4f} +- {_ms(fold_forecast_test_metrics, 'scc')[1]:.4f}")
+    print(f"  DTW   : {_ms(fold_forecast_test_metrics, 'dtw')[0]:.6f} +- {_ms(fold_forecast_test_metrics, 'dtw')[1]:.6f}")
+
+    print("\nClassification Val (mean +- std across folds):")
+    print(f"  Acc   : {_ms(fold_cls_val_metrics, 'acc')[0]:.4f} +- {_ms(fold_cls_val_metrics, 'acc')[1]:.4f}")
+    print(f"  F1    : {_ms(fold_cls_val_metrics, 'f1')[0]:.4f} +- {_ms(fold_cls_val_metrics, 'f1')[1]:.4f}")
+    print(f"  AUCROC: {_ms(fold_cls_val_metrics, 'aucroc')[0]:.4f} +- {_ms(fold_cls_val_metrics, 'aucroc')[1]:.4f}")
+
+    print("\nClassification Test (mean +- std across folds):")
+    print(f"  Acc   : {_ms(fold_cls_test_metrics, 'acc')[0]:.4f} +- {_ms(fold_cls_test_metrics, 'acc')[1]:.4f}")
+    print(f"  F1    : {_ms(fold_cls_test_metrics, 'f1')[0]:.4f} +- {_ms(fold_cls_test_metrics, 'f1')[1]:.4f}")
+    print(f"  AUCROC: {_ms(fold_cls_test_metrics, 'aucroc')[0]:.4f} +- {_ms(fold_cls_test_metrics, 'aucroc')[1]:.4f}")
 
 
 if __name__ == "__main__":

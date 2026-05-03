@@ -12,14 +12,14 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 from tqdm import tqdm
 
 from data.rbc_dataset import make_dataloaders
-from data.eeg_h5_dataset import (
-    NUM_CHANNELS,
-    FREQUENCY,
-    load_timeseries_seconds,
-    make_eeg_dataloaders,
-)
+# from data.eeg_h5_dataset import (
+#     NUM_CHANNELS,
+#     FREQUENCY,
+#     load_timeseries_seconds,
+#     make_eeg_dataloaders,
+# )
 from model.braindyn import BrainDyn, BrainDynConfig
-from model.losses import total_loss
+from model.losses import dtw_mean_normalized, total_loss
 
 
 def set_seed(seed: int) -> None:
@@ -310,12 +310,13 @@ def run_epoch_ar_train(
         )
 
     if n_chunks == 0:
-        return {"total": float("nan"), "mse": float("nan"), "mae": float("nan"), "pcc": float("nan"), "scc": float("nan")}
+        return {"total": float("nan"), "mse": float("nan"), "mae": float("nan"), "pcc": float("nan"), "scc": float("nan"), "dtw": float("nan")}
 
     all_pred = np.concatenate(pred_accum)
     all_true = np.concatenate(true_accum)
     pcc_val, _ = pearsonr(all_pred, all_true)
     scc_val, _ = spearmanr(all_pred, all_true)
+    dtw_val = dtw_mean_normalized(all_pred.reshape(-1, 1), all_true.reshape(-1, 1))
 
     return {
         "total": total_running / n_chunks,
@@ -323,6 +324,7 @@ def run_epoch_ar_train(
         "mae": mae_running / n_chunks,
         "pcc": float(pcc_val),
         "scc": float(scc_val),
+        "dtw": float(dtw_val),
     }
 
 
@@ -383,6 +385,7 @@ def run_epoch(
     mae_running = 0.0
     pcc_running = 0.0
     scc_running = 0.0
+    dtw_running = 0.0
     n_batches = 0
 
     pbar = tqdm(loader, desc=desc, leave=False)
@@ -437,12 +440,13 @@ def run_epoch(
         mse_running += float(losses["mse"].detach().cpu())
         mae_running += float(losses["mae"].detach().cpu())
 
-        y_pred_np = y_pred.detach().cpu().numpy().ravel()
-        y_true_np = y_true.detach().cpu().numpy().ravel()
-        pcc_val, _ = pearsonr(y_pred_np, y_true_np)
-        scc_val, _ = spearmanr(y_pred_np, y_true_np)
+        y_pred_np = y_pred.detach().cpu().numpy()
+        y_true_np = y_true.detach().cpu().numpy()
+        pcc_val, _ = pearsonr(y_pred_np.ravel(), y_true_np.ravel())
+        scc_val, _ = spearmanr(y_pred_np.ravel(), y_true_np.ravel())
         pcc_running += float(pcc_val)
         scc_running += float(scc_val)
+        dtw_running += dtw_mean_normalized(y_pred_np, y_true_np)
         n_batches += 1
 
         pbar.set_postfix(
@@ -452,11 +456,12 @@ def run_epoch(
                 "mae": f"{mae_running / n_batches:.4f}",
                 "pcc": f"{pcc_running / n_batches:.4f}",
                 "scc": f"{scc_running / n_batches:.4f}",
+                "dtw": f"{dtw_running / n_batches:.4f}",
             }
         )
 
     if n_batches == 0:
-        return {"total": float("nan"), "mse": float("nan"), "mae": float("nan"), "pcc": float("nan"), "scc": float("nan")}
+        return {"total": float("nan"), "mse": float("nan"), "mae": float("nan"), "pcc": float("nan"), "scc": float("nan"), "dtw": float("nan")}
 
     return {
         "total": total_running / n_batches,
@@ -464,6 +469,7 @@ def run_epoch(
         "mae": mae_running / n_batches,
         "pcc": pcc_running / n_batches,
         "scc": scc_running / n_batches,
+        "dtw": dtw_running / n_batches,
     }
 
 
@@ -501,6 +507,7 @@ def run_test_rollout_chunks(
     mae_running = 0.0
     pcc_running = 0.0
     scc_running = 0.0
+    dtw_running = 0.0
     n_chunks = 0
 
     pbar = tqdm(run_starts.items(), desc=desc, leave=False)
@@ -543,12 +550,13 @@ def run_test_rollout_chunks(
             mse_running += float(losses["mse"].detach().cpu())
             mae_running += float(losses["mae"].detach().cpu())
 
-            y_pred_np = y_pred.detach().cpu().numpy().ravel()
-            y_true_np = y_true.detach().cpu().numpy().ravel()
-            pcc_val, _ = pearsonr(y_pred_np, y_true_np)
-            scc_val, _ = spearmanr(y_pred_np, y_true_np)
+            y_pred_np = y_pred.detach().cpu().numpy()
+            y_true_np = y_true.detach().cpu().numpy()
+            pcc_val, _ = pearsonr(y_pred_np.ravel(), y_true_np.ravel())
+            scc_val, _ = spearmanr(y_pred_np.ravel(), y_true_np.ravel())
             pcc_running += float(pcc_val)
             scc_running += float(scc_val)
+            dtw_running += dtw_mean_normalized(y_pred_np, y_true_np)
             n_chunks += 1
 
             pred_hist = y_pred.permute(1, 2, 0, 3)
@@ -564,11 +572,12 @@ def run_test_rollout_chunks(
                     "mae": f"{mae_running / n_chunks:.4f}",
                     "pcc": f"{pcc_running / n_chunks:.4f}",
                     "scc": f"{scc_running / n_chunks:.4f}",
+                    "dtw": f"{dtw_running / n_chunks:.4f}",
                 }
             )
 
     if n_chunks == 0:
-        return {"total": float("nan"), "mse": float("nan"), "mae": float("nan"), "pcc": float("nan"), "scc": float("nan")}
+        return {"total": float("nan"), "mse": float("nan"), "mae": float("nan"), "pcc": float("nan"), "scc": float("nan"), "dtw": float("nan")}
 
     return {
         "total": total_running / n_chunks,
@@ -576,6 +585,7 @@ def run_test_rollout_chunks(
         "mae": mae_running / n_chunks,
         "pcc": pcc_running / n_chunks,
         "scc": scc_running / n_chunks,
+        "dtw": dtw_running / n_chunks,
     }
 
 
@@ -601,15 +611,15 @@ def parse_args():
         help="dataset backend: fmri (RBC manifest CSV) or eeg (HDF5 root)",
     )
     ap.add_argument("--manifest_csv", type=str, default="data/manifest.csv")
-    ap.add_argument("--eeg_h5_root", type=str, default="data/eeg_h5")
-    ap.add_argument(
-        "--eeg_manifest_csv",
-        type=str,
-        default="data/tusz_manifest.csv",
-        help="EEG manifest CSV (same role as --manifest_csv for fMRI)",
-    )
-    ap.add_argument("--eeg_frequency", type=int, default=FREQUENCY, help="EEG sampling rate used in HDF5 resampled_signal")
-    ap.add_argument("--eeg_num_channels", type=int, default=NUM_CHANNELS, help="EEG channel count (nodes); default 19")
+    # ap.add_argument("--eeg_h5_root", type=str, default="data/eeg_h5")
+    # ap.add_argument(
+    #     "--eeg_manifest_csv",
+    #     type=str,
+    #     default="data/tusz_manifest.csv",
+    #     help="EEG manifest CSV (same role as --manifest_csv for fMRI)",
+    # )
+    # ap.add_argument("--eeg_frequency", type=int, default=FREQUENCY, help="EEG sampling rate used in HDF5 resampled_signal")
+    # ap.add_argument("--eeg_num_channels", type=int, default=NUM_CHANNELS, help="EEG channel count (nodes); default 19")
     ap.add_argument("--cohort", type=str, default=None, help="PNC, HBN, or None for both")
     ap.add_argument("--x", type=int, default=30, help="context length")
     ap.add_argument("--y", type=int, default=10, help="forecast horizon length")
@@ -629,10 +639,10 @@ def parse_args():
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
 
-    ap.add_argument("--hidden_dim", type=int, default=64)
+    ap.add_argument("--hidden_dim", type=int, default=128)
     ap.add_argument("--lstm_layers", type=int, default=1)
-    ap.add_argument("--lstm_dropout", type=float, default=0.0)
-    ap.add_argument("--map_hidden_dim", type=int, default=16)
+    ap.add_argument("--lstm_dropout", type=float, default=0.1)
+    ap.add_argument("--map_hidden_dim", type=int, default=64)
     ap.add_argument("--vf_hidden_dim", type=int, default=128)
 
     ap.add_argument("--lambda_mse", type=float, default=1.0)
@@ -1138,12 +1148,14 @@ def main():
     print(f"  MAE   : {_ms(fold_val_metrics, 'mae')[0]:.6f} ± {_ms(fold_val_metrics, 'mae')[1]:.6f}")
     print(f"  PCC   : {_ms(fold_val_metrics, 'pcc')[0]:.4f}  ± {_ms(fold_val_metrics, 'pcc')[1]:.4f}")
     print(f"  SCC   : {_ms(fold_val_metrics, 'scc')[0]:.4f}  ± {_ms(fold_val_metrics, 'scc')[1]:.4f}")
+    print(f"  DTW   : {_ms(fold_val_metrics, 'dtw')[0]:.6f} ± {_ms(fold_val_metrics, 'dtw')[1]:.6f}")
 
     print("\nCV Test Summary (mean ± std across folds):")
     print(f"  MSE   : {_ms(fold_test_scores, 'mse')[0]:.6f} ± {_ms(fold_test_scores, 'mse')[1]:.6f}")
     print(f"  MAE   : {_ms(fold_test_scores, 'mae')[0]:.6f} ± {_ms(fold_test_scores, 'mae')[1]:.6f}")
     print(f"  PCC   : {_ms(fold_test_scores, 'pcc')[0]:.4f}  ± {_ms(fold_test_scores, 'pcc')[1]:.4f}")
     print(f"  SCC   : {_ms(fold_test_scores, 'scc')[0]:.4f}  ± {_ms(fold_test_scores, 'scc')[1]:.4f}")
+    print(f"  DTW   : {_ms(fold_test_scores, 'dtw')[0]:.6f} ± {_ms(fold_test_scores, 'dtw')[1]:.6f}")
 
 
 if __name__ == "__main__":

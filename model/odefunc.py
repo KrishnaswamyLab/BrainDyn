@@ -46,9 +46,9 @@ class BrainDynODEFunc(nn.Module):
 
         self.vector_field = nn.Sequential(
             nn.Linear(signal_dim + hidden_dim, vf_hidden_dim),
-            nn.Tanh(),
+            nn.GELU(),
             nn.Linear(vf_hidden_dim, vf_hidden_dim),
-            nn.Tanh(),
+            nn.GELU(),
             nn.Linear(vf_hidden_dim, signal_dim),
         )
 
