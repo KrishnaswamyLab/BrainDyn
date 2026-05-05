@@ -109,6 +109,14 @@ class BrainDyn(nn.Module):
         t_eval = torch.arange(pred_steps + 1, device=x_history.device, dtype=x_history.dtype) * dt_t.to(dtype=x_history.dtype)
         x_traj = odeint(rhs, x0, t_eval, method=self.ode_method)
         x_pred = x_traj[1:]
+        # t_eval = torch.arange(pred_steps + 1, device=x_history.device, dtype=x_history.dtype)
+        # t_eval = torch.linspace(0, pred_steps, 21)
+        # ode_kwargs: dict = {}
+        # if self.ode_method in {"rk4", "euler", "midpoint"}:
+        #     ode_kwargs["options"] = {"step_size": dt}
+        # x_traj = odeint(rhs, x0, t_eval, method=self.ode_method, **ode_kwargs)
+        # x_pred = x_traj[::2]
+        # x_pred = x_pred[1:]
 
         out = {"x_pred": x_pred}
         if return_aux:

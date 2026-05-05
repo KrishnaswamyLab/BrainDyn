@@ -81,11 +81,11 @@ class SNDataset(Dataset):
         split: SPLITS = "train",
         x: int = 90,
         y: int = 30,
-        stride: int = 1,
+        stride: int = 10,
         train_frac: float = 0.8,
         val_frac: float = 0.1,
         split_seed: int = 0,
-        cache: bool = False,
+        cache: bool = True,
     ) -> None:
         """
         Args:

@@ -8,6 +8,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from scipy.stats import spearmanr
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 from tqdm import tqdm
 
@@ -20,7 +21,7 @@ def parse_args():
 	ap = argparse.ArgumentParser(
 		description="Visualize fixed-horizon dynamics on the CV validation split (non-autoregressive)."
 	)
-	ap.add_argument("--checkpoint", type=str, default="checkpoints/braindyn_rbc_pnc_best_fold1.pt")
+	ap.add_argument("--checkpoint", type=str, default="checkpoints/braindyn_rbc_pnc_short_main_best_fold5.pt")
 	ap.add_argument("--manifest_csv", type=str, default=None, help="Defaults to training config from checkpoint")
 	ap.add_argument("--cohort", type=str, default=None, help="PNC, HBN, or None (defaults to checkpoint config)")
 	ap.add_argument("--batch_size", type=int, default=8)
@@ -57,6 +58,41 @@ def pearson_corr(y_pred, y_true, eps=1e-8):
 	if den <= eps:
 		return 0.0
 	return float(np.dot(p, t) / den)
+
+
+def wape(y_pred, y_true, eps=1e-8):
+	"""Weighted Absolute Percentage Error: sum|pred-true| / sum|true|."""
+	num = np.sum(np.abs(y_pred.reshape(-1).astype(np.float64) - y_true.reshape(-1).astype(np.float64)))
+	den = np.sum(np.abs(y_true.reshape(-1).astype(np.float64)))
+	return float(num / max(den, eps))
+
+
+def spearman_corr(y_pred, y_true):
+	"""Spearman rank correlation on flattened arrays."""
+	p = y_pred.reshape(-1).astype(np.float64)
+	t = y_true.reshape(-1).astype(np.float64)
+	res = spearmanr(p, t)
+	val = res.statistic if hasattr(res, "statistic") else res.correlation
+	return float(val) if not np.isnan(float(val)) else 0.0
+
+
+def dtw_distance(y_pred, y_true):
+	"""Mean per-ROI DTW distance averaged over ROIs."""
+	p2d = y_pred.reshape(-1, 1) if y_pred.ndim == 1 else y_pred
+	t2d = y_true.reshape(-1, 1) if y_true.ndim == 1 else y_true
+	T, n = p2d.shape
+	total = 0.0
+	for roi in range(n):
+		p = p2d[:, roi].astype(np.float64)
+		t = t2d[:, roi].astype(np.float64)
+		D = np.full((T + 1, T + 1), np.inf)
+		D[0, 0] = 0.0
+		for i in range(1, T + 1):
+			for j in range(1, T + 1):
+				cost = abs(p[i - 1] - t[j - 1])
+				D[i, j] = cost + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
+		total += D[T, T]
+	return total / max(n, 1)
 
 
 def make_subset_loader(dataset, indices, batch_size, num_workers, pin_memory, shuffle):
@@ -213,15 +249,17 @@ def plot_val_sample(
 
 	fig.suptitle(
 		(
-			f"Validation Window ({group}) | mse={meta['sample_mse']:.6f} | corr={meta['sample_corr']:.4f} | "
+			f"Validation Window ({group}) | mse={meta['sample_mse']:.6f} | mae={meta['sample_mae']:.6f} | "
+			f"wape={meta['sample_wape']:.4f} | dtw={meta['sample_dtw']:.4f} | "
+			f"pcc={meta['sample_pcc']:.4f} | scc={meta['sample_scc']:.4f} | "
 			f"cohort={meta['cohort']} subject={meta['subject_id']} run={meta['run']} t0={meta['t_start']}"
 		),
-		fontsize=12.5,
+		fontsize=11,
 	)
 	fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.965])
 
 	file_name = (
-		f"{group}_{sample_index:03d}_mse-{meta['sample_mse']:.6f}_corr-{meta['sample_corr']:.4f}_cohort-{sanitize_label(meta['cohort'])}"
+		f"{group}_{sample_index:03d}_mse-{meta['sample_mse']:.6f}_pcc-{meta['sample_pcc']:.4f}_cohort-{sanitize_label(meta['cohort'])}"
 		f"_subject-{sanitize_label(meta['subject_id'])}_run-{sanitize_label(meta['run'])}"
 		f"_t0-{int(meta['t_start']):04d}.png"
 	)
@@ -346,7 +384,10 @@ def main():
 	total_running = 0.0
 	total_mse = 0.0
 	total_mae = 0.0
+	total_wape = 0.0
+	total_dtw = 0.0
 	total_corr = 0.0
+	total_scc = 0.0
 	n_corr = 0
 	n_batches = 0
 	windows_processed = 0
@@ -400,12 +441,23 @@ def main():
 
 			for i in range(batch_size):
 				sample_mse = float(np.mean((y_pred_bn[i] - y_true_bn[i]) ** 2))
-				sample_corr = pearson_corr(y_pred_bn[i], y_true_bn[i])
-				total_corr += sample_corr
+				sample_mae = float(np.mean(np.abs(y_pred_bn[i] - y_true_bn[i])))
+				sample_wape = wape(y_pred_bn[i], y_true_bn[i])
+				sample_dtw = dtw_distance(y_pred_bn[i], y_true_bn[i])
+				sample_pcc = pearson_corr(y_pred_bn[i], y_true_bn[i])
+				sample_scc = spearman_corr(y_pred_bn[i], y_true_bn[i])
+				total_corr += sample_pcc
 				n_corr += 1
+				total_wape += sample_wape
+				total_dtw += sample_dtw
+				total_scc += sample_scc
 				record = {
 					"sample_mse": sample_mse,
-					"sample_corr": sample_corr,
+					"sample_mae": sample_mae,
+					"sample_wape": sample_wape,
+					"sample_dtw": sample_dtw,
+					"sample_pcc": sample_pcc,
+					"sample_scc": sample_scc,
 					"path": meta["path"][i],
 					"t_start": int(meta["t_start"][i]),
 					"cohort": meta["cohort"][i],
@@ -435,7 +487,10 @@ def main():
 					"total": f"{total_running / max(n_batches, 1):.4f}",
 					"mse": f"{total_mse / max(n_batches, 1):.4f}",
 					"mae": f"{total_mae / max(n_batches, 1):.4f}",
-					"corr": f"{total_corr / max(n_corr, 1):.4f}",
+					"wape": f"{total_wape / max(n_corr, 1):.4f}",
+					"dtw": f"{total_dtw / max(n_corr, 1):.4f}",
+					"pcc": f"{total_corr / max(n_corr, 1):.4f}",
+					"scc": f"{total_scc / max(n_corr, 1):.4f}",
 				}
 			)
 
@@ -454,7 +509,11 @@ def main():
 
 		sample_meta = {
 			"sample_mse": rec["sample_mse"],
-			"sample_corr": rec["sample_corr"],
+			"sample_mae": rec["sample_mae"],
+			"sample_wape": rec["sample_wape"],
+			"sample_dtw": rec["sample_dtw"],
+			"sample_pcc": rec["sample_pcc"],
+			"sample_scc": rec["sample_scc"],
 			"cohort": rec["cohort"],
 			"subject_id": rec["subject_id"],
 			"run": rec["run"],
@@ -474,7 +533,11 @@ def main():
 		saved_paths.append(str(out_path))
 		best_samples.append({
 			"sample_mse": rec["sample_mse"],
-			"sample_corr": rec["sample_corr"],
+			"sample_mae": rec["sample_mae"],
+			"sample_wape": rec["sample_wape"],
+			"sample_dtw": rec["sample_dtw"],
+			"sample_pcc": rec["sample_pcc"],
+			"sample_scc": rec["sample_scc"],
 			"cohort": rec["cohort"],
 			"subject_id": rec["subject_id"],
 			"run": rec["run"],
@@ -494,7 +557,11 @@ def main():
 
 		sample_meta = {
 			"sample_mse": rec["sample_mse"],
-			"sample_corr": rec["sample_corr"],
+			"sample_mae": rec["sample_mae"],
+			"sample_wape": rec["sample_wape"],
+			"sample_dtw": rec["sample_dtw"],
+			"sample_pcc": rec["sample_pcc"],
+			"sample_scc": rec["sample_scc"],
 			"cohort": rec["cohort"],
 			"subject_id": rec["subject_id"],
 			"run": rec["run"],
@@ -514,7 +581,11 @@ def main():
 		saved_paths.append(str(out_path))
 		worst_samples.append({
 			"sample_mse": rec["sample_mse"],
-			"sample_corr": rec["sample_corr"],
+			"sample_mae": rec["sample_mae"],
+			"sample_wape": rec["sample_wape"],
+			"sample_dtw": rec["sample_dtw"],
+			"sample_pcc": rec["sample_pcc"],
+			"sample_scc": rec["sample_scc"],
 			"cohort": rec["cohort"],
 			"subject_id": rec["subject_id"],
 			"run": rec["run"],
@@ -547,7 +618,10 @@ def main():
 		"mean_total": (total_running / max(n_batches, 1)),
 		"mean_mse": (total_mse / max(n_batches, 1)),
 		"mean_mae": (total_mae / max(n_batches, 1)),
-		"mean_corr": (total_corr / max(n_corr, 1)),
+		"mean_wape": (total_wape / max(n_corr, 1)),
+		"mean_dtw": (total_dtw / max(n_corr, 1)),
+		"mean_pcc": (total_corr / max(n_corr, 1)),
+		"mean_scc": (total_scc / max(n_corr, 1)),
 		"best_samples": best_samples,
 		"worst_samples": worst_samples,
 		"out_dir": str(out_dir),
@@ -562,9 +636,12 @@ def main():
 	print(f"  out_dir: {out_dir}")
 	print(f"  summary: {summary_path}")
 	print(f"  mean val total: {summary['mean_total']:.6f}")
-	print(f"  mean val MSE: {summary['mean_mse']:.6f}")
-	print(f"  mean val MAE: {summary['mean_mae']:.6f}")
-	print(f"  mean val corr: {summary['mean_corr']:.6f}")
+	print(f"  mean val MSE:   {summary['mean_mse']:.6f}")
+	print(f"  mean val MAE:   {summary['mean_mae']:.6f}")
+	print(f"  mean val WAPE:  {summary['mean_wape']:.6f}")
+	print(f"  mean val DTW:   {summary['mean_dtw']:.6f}")
+	print(f"  mean val PCC:   {summary['mean_pcc']:.6f}")
+	print(f"  mean val SCC:   {summary['mean_scc']:.6f}")
 
 
 if __name__ == "__main__":

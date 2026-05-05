@@ -203,6 +203,8 @@ class RBCDataset(Dataset):
 
         ctx = torch.from_numpy(((ctx_np - mean) / std).copy())
         hrz = torch.from_numpy(((hrz_np - mean) / std).copy())
+        # ctx = torch.from_numpy(ctx_np.copy())
+        # hrz = torch.from_numpy(hrz_np.copy())
 
         meta_out = dict(meta)
         meta_out["t_start"] = int(t)

@@ -50,6 +50,19 @@ def split_binary_window(batch: dict, x_len: int, device: torch.device) -> tuple[
     return x_history, y_true
 
 
+def minmax_normalize_pred_to_true(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Normalize both y_pred and y_true to [0, 1] using y_true's min/max."""
+    dims = (0, 3)
+    true_min = y_true.amin(dim=dims, keepdim=True)
+    true_max = y_true.amax(dim=dims, keepdim=True)
+    denom = true_max - true_min + eps
+    return (y_pred - true_min) / denom, (y_true - true_min) / denom
+
+
 def collect_node_features_binary(loader: DataLoader, x_len: int, max_batches: int) -> torch.Tensor:
     chunks: list[torch.Tensor] = []
 
@@ -133,6 +146,7 @@ def run_forecasting_epoch(
                     return_aux=False,
                 )
                 y_pred = out["x_pred"]
+                # y_pred, y_true = minmax_normalize_pred_to_true(y_pred=y_pred, y_true=y_true)
                 losses = total_loss(y_pred, y_true, lambda_mse=lambda_mse, lambda_mae=lambda_mae)
                 loss = losses["total"]
 
@@ -602,7 +616,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--hidden_dim", type=int, default=128)
     ap.add_argument("--lstm_layers", type=int, default=1)
     ap.add_argument("--lstm_dropout", type=float, default=0.0)
-    ap.add_argument("--map_hidden_dim", type=int, default=64)
+    ap.add_argument("--map_hidden_dim", type=int, default=128)
     ap.add_argument("--vf_hidden_dim", type=int, default=128)
     ap.add_argument("--ode_method", type=str, default="rk4", choices=["rk4", "dopri5", "euler", "midpoint"])
     ap.add_argument("--dt", type=float, default=1.0)

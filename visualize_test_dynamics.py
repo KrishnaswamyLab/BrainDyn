@@ -7,6 +7,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from scipy.stats import spearmanr
 from tqdm import tqdm
 
 from data.rbc_dataset import make_dataloaders
@@ -18,7 +19,7 @@ def parse_args():
     ap = argparse.ArgumentParser(
                 description="Visualize autoregressive test-rollout dynamics on the TEST split."
     )
-    ap.add_argument("--checkpoint", type=str, default="checkpoints/braindyn_rbc_pnc_long_main_best_fold5.pt")
+    ap.add_argument("--checkpoint", type=str, default="/gpfs/radev/project/krishnaswamy_smita/sv496/BrainDyn/checkpoints/braindyn_rbc_pnc_short_main_best_fold1.pt")
     ap.add_argument("--manifest_csv", type=str, default=None, help="Defaults to training config from checkpoint")
     ap.add_argument("--cohort", type=str, default=None, help="PNC, HBN, or None (defaults to checkpoint config)")
     ap.add_argument("--batch_size", type=int, default=8)
@@ -67,6 +68,41 @@ def pearson_corr(y_pred, y_true, eps=1e-8):
     if den <= eps:
         return 0.0
     return float(np.dot(p, t) / den)
+
+
+def wape(y_pred, y_true, eps=1e-8):
+    """Weighted Absolute Percentage Error: sum|pred-true| / sum|true|."""
+    num = np.sum(np.abs(y_pred.reshape(-1).astype(np.float64) - y_true.reshape(-1).astype(np.float64)))
+    den = np.sum(np.abs(y_true.reshape(-1).astype(np.float64)))
+    return float(num / max(den, eps))
+
+
+def spearman_corr(y_pred, y_true):
+    """Spearman rank correlation on flattened arrays."""
+    p = y_pred.reshape(-1).astype(np.float64)
+    t = y_true.reshape(-1).astype(np.float64)
+    res = spearmanr(p, t)
+    val = res.statistic if hasattr(res, "statistic") else res.correlation
+    return float(val) if not np.isnan(float(val)) else 0.0
+
+
+def dtw_distance(y_pred, y_true):
+    """Mean per-ROI DTW distance averaged over ROIs."""
+    p2d = y_pred.reshape(-1, 1) if y_pred.ndim == 1 else y_pred
+    t2d = y_true.reshape(-1, 1) if y_true.ndim == 1 else y_true
+    T, n = p2d.shape
+    total = 0.0
+    for roi in range(n):
+        p = p2d[:, roi].astype(np.float64)
+        t = t2d[:, roi].astype(np.float64)
+        D = np.full((T + 1, T + 1), np.inf)
+        D[0, 0] = 0.0
+        for i in range(1, T + 1):
+            for j in range(1, T + 1):
+                cost = abs(p[i - 1] - t[j - 1])
+                D[i, j] = cost + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
+        total += D[T, T]
+    return total / max(n, 1)
 
 
 def iter_test_runs(loader, max_runs=None):
@@ -212,15 +248,17 @@ def plot_rollout_sample(
 
     fig.suptitle(
         (
-            f"Test Rollout | mse={meta['sample_mse']:.6f} | corr={meta['sample_corr']:.4f} | "
+            f"Test Rollout | mse={meta['sample_mse']:.6f} | mae={meta['sample_mae']:.6f} | "
+            f"wape={meta['sample_wape']:.4f} | dtw={meta['sample_dtw']:.4f} | "
+            f"pcc={meta['sample_pcc']:.4f} | scc={meta['sample_scc']:.4f} | "
             f"cohort={meta['cohort']} subject={meta['subject_id']} run={meta['run']}"
         ),
-        fontsize=12.5,
+        fontsize=11,
     )
     fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.965])
 
     file_name = (
-        f"sample_{sample_index:03d}_mse-{meta['sample_mse']:.6f}_corr-{meta['sample_corr']:.4f}"
+        f"sample_{sample_index:03d}_mse-{meta['sample_mse']:.6f}_pcc-{meta['sample_pcc']:.4f}"
         f"_cohort-{sanitize_label(meta['cohort'])}"
         f"_subject-{sanitize_label(meta['subject_id'])}_run-{sanitize_label(meta['run'])}.png"
     )
@@ -317,7 +355,10 @@ def main():
     total_running = 0.0
     total_mse = 0.0
     total_mae = 0.0
+    total_wape = 0.0
+    total_dtw = 0.0
     total_corr = 0.0
+    total_scc = 0.0
     n_corr = 0
     n_chunks = 0
     runs_processed = 0
@@ -379,6 +420,9 @@ def main():
                     chunk_corr = pearson_corr(pred_step, gt_norm)
                     total_corr += chunk_corr
                     n_corr += 1
+                    total_wape += wape(pred_step, gt_norm)
+                    total_dtw += dtw_distance(pred_step, gt_norm)
+                    total_scc += spearman_corr(pred_step, gt_norm)
 
                     pred_chunks.append(pred_step)
                     gt_chunks.append(gt_norm)
@@ -395,26 +439,41 @@ def main():
                             "total": f"{total_running / max(n_chunks, 1):.4f}",
                             "mse": f"{total_mse / max(n_chunks, 1):.4f}",
                             "mae": f"{total_mae / max(n_chunks, 1):.4f}",
-                            "corr": f"{total_corr / max(n_corr, 1):.4f}",
+                            "wape": f"{total_wape / max(n_chunks, 1):.4f}",
+                            "dtw": f"{total_dtw / max(n_chunks, 1):.4f}",
+                            "pcc": f"{total_corr / max(n_corr, 1):.4f}",
+                            "scc": f"{total_scc / max(n_chunks, 1):.4f}",
                         }
                     )
 
                 runs_processed += 1
 
                 sample_mse = float("nan")
-                sample_corr = float("nan")
+                sample_mae = float("nan")
+                sample_wape = float("nan")
+                sample_dtw = float("nan")
+                sample_pcc = float("nan")
+                sample_scc = float("nan")
                 if pred_chunks:
                     pred_norm = np.concatenate(pred_chunks, axis=0)
                     gt_norm_full = np.concatenate(gt_chunks, axis=0)
                     sample_mse = float(np.mean((pred_norm - gt_norm_full) ** 2))
-                    sample_corr = pearson_corr(pred_norm, gt_norm_full)
+                    sample_mae = float(np.mean(np.abs(pred_norm - gt_norm_full)))
+                    sample_wape = wape(pred_norm, gt_norm_full)
+                    sample_dtw = dtw_distance(pred_norm, gt_norm_full)
+                    sample_pcc = pearson_corr(pred_norm, gt_norm_full)
+                    sample_scc = spearman_corr(pred_norm, gt_norm_full)
 
                 if saved < args.n_samples and pred_chunks:
                     future_raw = np.concatenate(gt_raw_chunks, axis=0)
                     pred_raw = pred_norm * std + mean
                     run_meta_vis = dict(run_meta)
                     run_meta_vis["sample_mse"] = sample_mse
-                    run_meta_vis["sample_corr"] = sample_corr
+                    run_meta_vis["sample_mae"] = sample_mae
+                    run_meta_vis["sample_wape"] = sample_wape
+                    run_meta_vis["sample_dtw"] = sample_dtw
+                    run_meta_vis["sample_pcc"] = sample_pcc
+                    run_meta_vis["sample_scc"] = sample_scc
                     out_path = plot_rollout_sample(
                         out_dir=out_dir,
                         sample_index=saved,
@@ -430,7 +489,11 @@ def main():
                         {
                             "sample_index": saved,
                             "sample_mse": sample_mse,
-                            "sample_corr": sample_corr,
+                            "sample_mae": sample_mae,
+                            "sample_wape": sample_wape,
+                            "sample_dtw": sample_dtw,
+                            "sample_pcc": sample_pcc,
+                            "sample_scc": sample_scc,
                             "cohort": run_meta["cohort"],
                             "subject_id": run_meta["subject_id"],
                             "run": run_meta["run"],
@@ -468,13 +531,25 @@ def main():
                     sample_corr = pearson_corr(y_pred_bn[i], y_true_bn[i])
                     total_corr += sample_corr
                     n_corr += 1
+                    total_wape += wape(y_pred_bn[i], y_true_bn[i])
+                    total_dtw += dtw_distance(y_pred_bn[i], y_true_bn[i])
+                    total_scc += spearman_corr(y_pred_bn[i], y_true_bn[i])
                     runs_processed += 1
 
                     if saved < args.n_samples:
                         sample_mse = float(np.mean((y_pred_bn[i] - y_true_bn[i]) ** 2))
+                        sample_mae = float(np.mean(np.abs(y_pred_bn[i] - y_true_bn[i])))
+                        sample_wape = wape(y_pred_bn[i], y_true_bn[i])
+                        sample_dtw = dtw_distance(y_pred_bn[i], y_true_bn[i])
+                        sample_pcc = sample_corr
+                        sample_scc = spearman_corr(y_pred_bn[i], y_true_bn[i])
                         run_meta_vis = {
                             "sample_mse": sample_mse,
-                            "sample_corr": sample_corr,
+                            "sample_mae": sample_mae,
+                            "sample_wape": sample_wape,
+                            "sample_dtw": sample_dtw,
+                            "sample_pcc": sample_pcc,
+                            "sample_scc": sample_scc,
                             "cohort": meta["cohort"][i],
                             "subject_id": meta["subject_id"][i],
                             "run": meta["run"][i],
@@ -494,7 +569,11 @@ def main():
                             {
                                 "sample_index": saved,
                                 "sample_mse": sample_mse,
-                                "sample_corr": sample_corr,
+                                "sample_mae": sample_mae,
+                                "sample_wape": sample_wape,
+                                "sample_dtw": sample_dtw,
+                                "sample_pcc": sample_pcc,
+                                "sample_scc": sample_scc,
                                 "cohort": meta["cohort"][i],
                                 "subject_id": meta["subject_id"][i],
                                 "run": meta["run"][i],
@@ -509,7 +588,10 @@ def main():
                         "total": f"{total_running / max(n_chunks, 1):.4f}",
                         "mse": f"{total_mse / max(n_chunks, 1):.4f}",
                         "mae": f"{total_mae / max(n_chunks, 1):.4f}",
-                        "corr": f"{total_corr / max(n_corr, 1):.4f}",
+                        "wape": f"{total_wape / max(n_chunks, 1):.4f}",
+                        "dtw": f"{total_dtw / max(n_chunks, 1):.4f}",
+                        "pcc": f"{total_corr / max(n_corr, 1):.4f}",
+                        "scc": f"{total_scc / max(n_chunks, 1):.4f}",
                     }
                 )
 
@@ -535,7 +617,10 @@ def main():
         "mean_total": (total_running / max(n_chunks, 1)),
         "mean_mse": (total_mse / max(n_chunks, 1)),
         "mean_mae": (total_mae / max(n_chunks, 1)),
-        "mean_corr": (total_corr / max(n_corr, 1)),
+        "mean_wape": (total_wape / max(n_chunks, 1)),
+        "mean_dtw": (total_dtw / max(n_chunks, 1)),
+        "mean_pcc": (total_corr / max(n_corr, 1)),
+        "mean_scc": (total_scc / max(n_chunks, 1)),
         "sample_summaries": sample_summaries,
         "out_dir": str(out_dir),
         "saved_plots": saved_paths,
@@ -549,9 +634,12 @@ def main():
     print(f"  out_dir: {out_dir}")
     print(f"  summary: {summary_path}")
     print(f"  mean test total: {summary['mean_total']:.6f}")
-    print(f"  mean test MSE: {summary['mean_mse']:.6f}")
-    print(f"  mean test MAE: {summary['mean_mae']:.6f}")
-    print(f"  mean test corr: {summary['mean_corr']:.6f}")
+    print(f"  mean test MSE:   {summary['mean_mse']:.6f}")
+    print(f"  mean test MAE:   {summary['mean_mae']:.6f}")
+    print(f"  mean test WAPE:  {summary['mean_wape']:.6f}")
+    print(f"  mean test DTW:   {summary['mean_dtw']:.6f}")
+    print(f"  mean test PCC:   {summary['mean_pcc']:.6f}")
+    print(f"  mean test SCC:   {summary['mean_scc']:.6f}")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import random
 import time
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from scipy.stats import pearsonr, spearmanr
@@ -107,6 +108,19 @@ def batch_to_model_tensors(batch: dict, device: torch.device) -> tuple[torch.Ten
     y_true = y_future.permute(1, 0, 2).unsqueeze(-1)
     return x_history, y_true
 
+
+def minmax_normalize_pred_to_true(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    eps: float = 1e-8,
+):
+    """Normalize both y_pred and y_true to [0, 1] using y_true's min/max."""
+    # dims = (0, 3)
+    # true_min = y_true.amin(dim=dims, keepdim=True)
+    # true_max = y_true.amax(dim=dims, keepdim=True)
+    # denom = true_max - true_min + eps
+    # return (y_pred - true_min) / denom, (y_true - true_min) / denom
+    return y_pred, y_true
 
 class SubjectRunDataset(torch.utils.data.Dataset):
     """Dataset that yields one full timeseries per subject run.
@@ -243,6 +257,7 @@ def run_epoch_ar_train(
                         autoregressive=False,
                     )
                     y_pred = out["x_pred"]  # (chunk_size, B, N, 1)
+                    y_pred, y_chunk = minmax_normalize_pred_to_true(y_pred=y_pred, y_true=y_chunk)
                     losses = total_loss(y_pred, y_chunk, lambda_mse=lambda_mse, lambda_mae=lambda_mae)
                     loss = losses["total"] / tbptt_chunks  # normalize by tbptt_chunks for gradient averaging
 
@@ -392,6 +407,13 @@ def run_epoch(
     for batch in pbar:
         x_history, y_true = batch_to_model_tensors(batch, edge_index.device)
         pred_steps = y_true.shape[0]
+        # y_true = y_true.permute(1, 2, 0, 3)
+        # result = torch.cat((x_history, y_true), dim=2)
+        # min_val, max_val = torch.aminmax(result, dim=2, keepdim = True)
+        # denom = (max_val - min_val).clamp_min(1e-6)
+        # x_history = (x_history - min_val) / denom
+        # y_true = (y_true - min_val) / denom
+        # y_true = y_true.permute(2, 0, 1, 3)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -419,6 +441,7 @@ def run_epoch(
                 else:
                     raise ValueError(f"Unknown forecast_mode='{forecast_mode}'. Use 'short' or 'long'.")
 
+                y_pred, y_true = minmax_normalize_pred_to_true(y_pred=y_pred, y_true=y_true)
                 losses = total_loss(y_pred, y_true, lambda_mse=lambda_mse, lambda_mae=lambda_mae)
                 loss = losses["total"]
 
@@ -589,6 +612,74 @@ def run_test_rollout_chunks(
     }
 
 
+def save_dynamics_plot(
+    model,
+    loader,
+    edge_index,
+    dt,
+    forecast_mode,
+    ar_chunk_size,
+    out_path: Path,
+    max_nodes: int = 4,
+) -> bool:
+    """Save a quick prediction-vs-truth dynamics plot from one loader batch."""
+    try:
+        batch = next(iter(loader))
+    except StopIteration:
+        return False
+
+    x_history, y_true = batch_to_model_tensors(batch, edge_index.device)
+    pred_steps = y_true.shape[0]
+    model.eval()
+    with torch.no_grad():
+        if forecast_mode in {"short", "long_ar_train"}:
+            out = model(
+                x_history=x_history,
+                edge_index=edge_index,
+                pred_steps=pred_steps,
+                dt=dt,
+                autoregressive=False,
+            )
+            y_pred = out["x_pred"]
+        elif forecast_mode == "long":
+            y_pred = rollout_autoregressive(
+                model=model,
+                x_history=x_history,
+                edge_index=edge_index,
+                dt=dt,
+                pred_steps=pred_steps,
+                chunk_size=ar_chunk_size,
+            )
+        else:
+            raise ValueError(f"Unknown forecast_mode='{forecast_mode}'.")
+
+    # Use first sample in batch and first few nodes to keep plots readable.
+    y_true_np = y_true[:, 0, :, 0].detach().cpu().numpy()  # (Ly, N)
+    y_pred_np = y_pred[:, 0, :, 0].detach().cpu().numpy()  # (Ly, N)
+
+    node_count = min(max_nodes, y_true_np.shape[1])
+    fig, axes = plt.subplots(node_count, 1, figsize=(10, 2.4 * node_count), sharex=True)
+    if node_count == 1:
+        axes = [axes]
+
+    t = np.arange(y_true_np.shape[0])
+    for node_idx in range(node_count):
+        ax = axes[node_idx]
+        ax.plot(t, y_true_np[:, node_idx], label="true", linewidth=2.0, color="#1f77b4")
+        ax.plot(t, y_pred_np[:, node_idx], label="pred", linewidth=1.8, linestyle="--", color="#d62728")
+        ax.set_ylabel(f"node {node_idx}")
+        ax.grid(alpha=0.3)
+        if node_idx == 0:
+            ax.legend(loc="best")
+
+    axes[-1].set_xlabel("forecast step")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return True
+
+
 def make_subset_loader(dataset, indices, batch_size, num_workers, pin_memory, shuffle):
     return DataLoader(
         Subset(dataset, list(indices)),
@@ -620,8 +711,8 @@ def parse_args():
     # )
     # ap.add_argument("--eeg_frequency", type=int, default=FREQUENCY, help="EEG sampling rate used in HDF5 resampled_signal")
     # ap.add_argument("--eeg_num_channels", type=int, default=NUM_CHANNELS, help="EEG channel count (nodes); default 19")
-    ap.add_argument("--cohort", type=str, default=None, help="PNC, HBN, or None for both")
-    ap.add_argument("--x", type=int, default=30, help="context length")
+    ap.add_argument("--cohort", type=str, default="PNC", help="PNC, HBN, or None for both")
+    ap.add_argument("--x", type=int, default=40, help="context length")
     ap.add_argument("--y", type=int, default=10, help="forecast horizon length")
     ap.add_argument("--stride", type=int, default=10)
     ap.add_argument("--min_t", type=int, default=0)
@@ -639,10 +730,10 @@ def parse_args():
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
 
-    ap.add_argument("--hidden_dim", type=int, default=64) #I had changed this from 64 to 128 
+    ap.add_argument("--hidden_dim", type=int, default=16)
     ap.add_argument("--lstm_layers", type=int, default=1)
     ap.add_argument("--lstm_dropout", type=float, default=0.0)
-    ap.add_argument("--map_hidden_dim", type=int, default=16) #I had changed this from 16 to 64
+    ap.add_argument("--map_hidden_dim", type=int, default=16)
     ap.add_argument("--vf_hidden_dim", type=int, default=128)
 
     ap.add_argument("--lambda_mse", type=float, default=1.0)
@@ -837,7 +928,7 @@ def main():
 
     default_save_path = "checkpoints/braindyn_rbc_best.pt"
     resolved_save_path = (
-        f"checkpoints/braindyn_{args.dataset}_{cohort_tag}_{forecast_tag}_{ablation_tag}_best.pt"
+        f"checkpoints/braindyn_{args.dataset}_{cohort_tag}_{forecast_tag}_{ablation_tag}_dt02_trainviz_best.pt"
         if args.save_path == default_save_path
         else args.save_path
     )
@@ -950,6 +1041,7 @@ def main():
             )
 
         fold_save_path = save_path.with_name(f"{save_path.stem}_fold{fold_idx + 1}{save_path.suffix}")
+        fold_plot_dir = Path("training") / f"{save_path.stem}_fold{fold_idx + 1}"
         best_val = float("inf")
 
         for epoch in range(1, args.epochs + 1):
@@ -1075,6 +1167,22 @@ def main():
                     fold_save_path,
                 )
                 print(f"Saved fold {fold_idx + 1} best checkpoint to {fold_save_path} (val total={best_val:.6f})")
+
+            if epoch % 5 == 0:
+                plot_path = fold_plot_dir / f"epoch_{epoch:03d}.png"
+                saved = save_dynamics_plot(
+                    model=model,
+                    loader=val_loader,
+                    edge_index=edge_index,
+                    dt=args.dt,
+                    forecast_mode=args.forecast_mode,
+                    ar_chunk_size=args.ar_chunk_size,
+                    out_path=plot_path,
+                )
+                if saved:
+                    print(f"Saved dynamics plot: {plot_path}")
+                else:
+                    print(f"Skipped dynamics plot at epoch {epoch}: validation loader had no batches")
 
         fold_val_scores.append(best_val)
 
