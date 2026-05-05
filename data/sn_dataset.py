@@ -2,8 +2,12 @@
 
 Expects ``dataset.npz`` from ``simulate_neuron_dataset.py``: rate arrays shaped
 ``[subjects, channels, time]`` plus perturbation metadata. Forecasting uses
-unperturbed rates with context-only z-scoring; perturbation mode returns full
-original and perturbed trajectories normalised with statistics from the original.
+unperturbed rates with context-only z-scoring. Perturbation mode returns paired
+windows ``x_original`` / ``x_perturbed`` (length ``x``) and ``y_original`` /
+``y_perturbed`` (length ``y``), aligned around the perturbation onset on the bin
+grid, normalised using per-channel mean/std from the full original trajectory;
+perturbed windows use the same statistics so originals and perturbations are
+comparable.
 """
 
 from __future__ import annotations
@@ -60,18 +64,37 @@ def _zscore_with_context_stats(
     return x, y
 
 
-def _zscore_pair_from_reference(
-    reference: np.ndarray, other: np.ndarray
-) -> tuple[torch.Tensor, torch.Tensor]:
-    mean = reference.mean(axis=0, keepdims=True)
-    std = reference.std(axis=0, keepdims=True).clip(1e-6)
-    a = torch.from_numpy(((reference - mean) / std).astype(np.float32).copy())
-    b = torch.from_numpy(((other - mean) / std).astype(np.float32).copy())
-    return a, b
+def _zscore_blocks_with_series_stats(
+    reference_tc: np.ndarray, *blocks_tc: np.ndarray
+) -> tuple[torch.Tensor, ...]:
+    """Per-channel z-score using mean/std over full time in ``reference_tc`` (T, C)."""
+    mean = reference_tc.mean(axis=0, keepdims=True)
+    std = reference_tc.std(axis=0, keepdims=True).clip(1e-6)
+    return tuple(
+        torch.from_numpy(((b - mean) / std).astype(np.float32).copy()) for b in blocks_tc
+    )
+
+
+def _pert_start_ms_to_center_bin_index(pert_start_ms: float, bin_edges_ms: np.ndarray) -> int:
+    """Map perturbation onset (ms) to the nearest discrete bin center index."""
+    edges = np.asarray(bin_edges_ms, dtype=np.float64).reshape(-1)
+    if edges.size < 2:
+        raise ValueError("bin_edges_ms must contain at least two edge values.")
+    n_bins = int(edges.size) - 1
+    idx = int(np.searchsorted(edges, pert_start_ms, side="right") - 1)
+    idx = max(0, min(idx, n_bins - 1))
+    width = float(edges[idx + 1] - edges[idx])
+    if width > 1e-12:
+        frac = (pert_start_ms - float(edges[idx])) / width
+        c_continuous = idx + frac
+    else:
+        c_continuous = float(idx)
+    c = int(round(c_continuous))
+    return max(0, min(c, n_bins - 1))
 
 
 class SNDataset(Dataset):
-    """Index over ``dataset.npz`` for forecasting windows or full-sequence perturbation pairs."""
+    """Index over ``dataset.npz`` for forecasting windows or perturbation-aligned windows."""
 
     def __init__(
         self,
@@ -89,12 +112,11 @@ class SNDataset(Dataset):
     ) -> None:
         """
         Args:
-            x: Number of context time bins given to the model as input
-                (`x[t : t + x]`) in forecasting mode.
-            y: Number of future time bins predicted by the model
-                (`y[t + x : t + x + y]`) in forecasting mode.
-                In perturbation mode, full trajectories are returned and
-                `x`/`y` are ignored.
+            x: Number of context time bins (`x[t : t + x]`) in forecasting mode;
+               same length for ``x_original`` / ``x_perturbed`` in perturbation mode.
+            y: Horizon length in forecasting; same length for ``y_original`` /
+               ``y_perturbed`` in perturbation mode. Perturbation windows are fixed
+               (one sample per subject) and ignore ``stride``.
         """
         if split not in CROSS_SUBJECT_SPLITS and split != "within":
             raise ValueError(f"invalid split: {split!r}")
@@ -146,6 +168,23 @@ class SNDataset(Dataset):
 
         # Same subject order as time series indexing: row k matches self._subject_ids[k].
         self._adjacency = np.asarray(_adj_full[self._subject_ids], dtype=np.int8)
+
+        if "bin_edges_ms" in self._npz.files:
+            self._bin_edges_ms = np.asarray(self._npz["bin_edges_ms"], dtype=np.float64).reshape(-1)
+        else:
+            proc = (
+                cast(dict[str, Any], run_cfg.get("base_config", {}))
+                .get("processing", {})
+                if isinstance(run_cfg.get("base_config", {}), dict)
+                else {}
+            )
+            bin_size = float(proc.get("bin_size_ms", 0.0))
+            if bin_size <= 0 or self.n_bins < 1:
+                raise KeyError(
+                    "dataset.npz must contain 'bin_edges_ms' or run_config.json must "
+                    "define base_config.processing.bin_size_ms"
+                )
+            self._bin_edges_ms = np.arange(self.n_bins + 1, dtype=np.float64) * bin_size
 
         self._index: list[tuple[int, ...]] = []
         self._build_sample_index()
@@ -210,7 +249,27 @@ class SNDataset(Dataset):
             s = int(self._subject_ids[k])
             orig = self._rates_orig_tc(s)
             pert = self._rates_pert_tc(s)
-            o_t, p_t = _zscore_pair_from_reference(orig, pert)
+            T = self.n_bins
+            need = self.x + self.y
+            if need > T:
+                raise ValueError(
+                    f"perturbation mode requires x+y<={T}, got x={self.x}, y={self.y}, T={T}"
+                )
+            c_bin = _pert_start_ms_to_center_bin_index(float(self._pert_start[s]), self._bin_edges_ms)
+            tx = c_bin - self.x // 2
+            tx = max(0, min(tx, T - need))
+            sl_x = slice(tx, tx + self.x)
+            sl_y = slice(tx + self.x, tx + need)
+            ctx_orig = orig[sl_x]
+            hrz_orig = orig[sl_y]
+            ctx_pert = pert[sl_x]
+            hrz_pert = pert[sl_y]
+            (
+                x_original,
+                y_original,
+                x_perturbed,
+                y_perturbed,
+            ) = _zscore_blocks_with_series_stats(orig, ctx_orig, hrz_orig, ctx_pert, hrz_pert)
             kn = int(self._pert_n[s])
             nodes = torch.from_numpy(self._pert_nodes[s].astype(np.int64).copy())
             mode = self._perturbation_mode or ""
@@ -218,6 +277,7 @@ class SNDataset(Dataset):
             meta = {
                 "subject_index": int(s),
                 "graph_seed": int(self._graph_seeds[s]),
+                "t_start": int(tx),
                 "split": self.split,
                 "T": self.n_bins,
                 "n_channels": self.n_channels,
@@ -228,7 +288,13 @@ class SNDataset(Dataset):
                 "perturbed_nodes": nodes,
                 "adjacency": adj,
             }
-            return {"x_original": o_t, "x_perturbed": p_t, "meta": meta}
+            return {
+                "x_original": x_original,
+                "y_original": y_original,
+                "x_perturbed": x_perturbed,
+                "y_perturbed": y_perturbed,
+                "meta": meta,
+            }
 
     def summary(self) -> str:
         return (
@@ -328,7 +394,9 @@ if __name__ == "__main__":
                     else:
                         print(
                             f'{name}: x_original={tuple(batch["x_original"].shape)} '
-                            f'{name}: x_perturbed={tuple(batch["x_perturbed"].shape)} '
+                            f'y_original={tuple(batch["y_original"].shape)} '
+                            f'x_perturbed={tuple(batch["x_perturbed"].shape)} '
+                            f'y_perturbed={tuple(batch["y_perturbed"].shape)} '
                             f'perturbation_start_ms={batch["meta"]["perturbation_start_ms"]}'
                             f'perturbation_end_ms={batch["meta"]["perturbation_end_ms"]}'
                             f'perturbation_mode={batch["meta"]["perturbation_mode"]}'

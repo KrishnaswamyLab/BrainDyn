@@ -1050,7 +1050,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate a NEST dataset where each graph node is one neuron.")
 
     p.add_argument("--n-nodes", type=int, default=100)
-    p.add_argument("--graph-rule", type=str, default="knn",
+    p.add_argument("--graph-rule", type=str, default="small_world",
                    choices=["knn", "distance", "erdos_renyi", "small_world"])
     p.add_argument("--dim", type=int, default=2)
     p.add_argument(
@@ -1071,7 +1071,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resolution-ms", type=float, default=0.1)
     p.add_argument("--threads", type=int, default=1)
     p.add_argument("--simulation-time-ms", type=float, default=2000.0)
-    p.add_argument("--synapse-weight", type=float, default=1.0)
+    p.add_argument("--synapse-weight", type=float, default=5.0)
     p.add_argument("--synapse-delay-ms", type=float, default=1.5)
     p.add_argument("--use-graph-weights", action="store_true")
 
@@ -1085,7 +1085,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bin-size-ms", type=float, default=10.0)
     p.add_argument("--smoothing-sigma-ms", type=float, default=20.0)
 
-    p.add_argument("--num-simulations", type=int, default=10_000)
+    p.add_argument("--num-simulations", type=int, default=1000)
     p.add_argument("--perturbation-mode", type=str, default="extra_poisson", choices=sorted(PERTURBATION_MODES))
     return p.parse_args()
 
