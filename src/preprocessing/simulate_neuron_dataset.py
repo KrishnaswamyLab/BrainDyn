@@ -556,18 +556,20 @@ def run_paired_smoothed_rates_hz(
         rates_orig = counts_to_smoothed_rates_hz(counts, cfg.processing)
         counts_pert = _apply_posthoc_perturbations_to_counts(counts, bin_edges_ms, [spec])
         rates_pert = counts_to_smoothed_rates_hz(counts_pert, cfg.processing)
-        return rates_orig, rates_pert, bin_edges_ms
+        adjacency = d["adjacency"]
+        return rates_orig, rates_pert, bin_edges_ms, adjacency
 
     if mode == "extra_poisson":
         cfg0 = replace(cfg, nest=replace(cfg.nest, perturbations=[]))
         d0 = nest_simulation_raw_counts(cfg0)
         bin_edges_ms = d0["bin_edges_ms"]
         rates_orig = counts_to_smoothed_rates_hz(d0["binned_counts"], cfg.processing)
+        adjacency = d0["adjacency"]
 
         cfg1 = replace(cfg, nest=replace(cfg.nest, perturbations=[spec]))
         d1 = nest_simulation_raw_counts(cfg1)
         rates_pert = counts_to_smoothed_rates_hz(d1["binned_counts"], cfg.processing)
-        return rates_orig, rates_pert, bin_edges_ms
+        return rates_orig, rates_pert, bin_edges_ms, adjacency
 
     raise ValueError(f"Unknown perturbation mode {mode!r}")
 
@@ -920,6 +922,7 @@ def simulate_bulk_neuron_dataset(
     pert_end_ms = np.zeros(num_simulations, dtype=np.float64)
     pert_n_nodes = np.zeros(num_simulations, dtype=np.int8)
     pert_nodes = np.full((num_simulations, 1), -1, dtype=np.int64)
+    adjacency = np.zeros((num_simulations, n_nodes, n_nodes), dtype=np.int8)
 
     bin_edges_ms: np.ndarray | None = None
     check_panels_path: str | None = None
@@ -943,7 +946,7 @@ def simulate_bulk_neuron_dataset(
         )
         _validate_perturbations([spec], n_nodes, cfg.nest.simulation_time_ms)
 
-        ro, rp, edges = run_paired_smoothed_rates_hz(cfg, spec, perturbation_mode)
+        ro, rp, edges, adj = run_paired_smoothed_rates_hz(cfg, spec, perturbation_mode)
         rates_o[s] = ro
         rates_p[s] = rp
         if bin_edges_ms is None:
@@ -954,6 +957,7 @@ def simulate_bulk_neuron_dataset(
         kn = len(spec.nodes)
         pert_n_nodes[s] = kn
         pert_nodes[s, :kn] = np.asarray(spec.nodes, dtype=np.int64)
+        adjacency[s] = adj
 
         if s == 0:
             be = bin_edges_ms
@@ -977,6 +981,7 @@ def simulate_bulk_neuron_dataset(
         "smoothed_rates_hz_perturbed": rates_p,
         "bin_edges_ms": bin_edges_ms.astype(np.float64),
         "graph_seeds": graph_seeds,
+        "adjacency": adjacency.astype(np.int8),
         "perturbation_start_ms": pert_start_ms,
         "perturbation_end_ms": pert_end_ms,
         "perturbation_n_nodes": pert_n_nodes,
