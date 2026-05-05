@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 from typing import Any, Literal, cast
+import argparse
+import time
 
 import numpy as np
 import torch
@@ -124,6 +126,7 @@ class SNDataset(Dataset):
         self._pert_n = np.asarray(self._npz["perturbation_n_nodes"], dtype=np.int64)
         self._pert_nodes = np.asarray(self._npz["perturbation_nodes"], dtype=np.int64)
         self._graph_seeds = np.asarray(self._npz["graph_seeds"], dtype=np.int64)
+        _adj_full = np.asarray(self._npz["adjacency"], dtype=np.int8)
 
         run_cfg = _read_run_config(path)
         self._perturbation_mode: str | None = run_cfg.get("perturbation_mode")
@@ -141,27 +144,30 @@ class SNDataset(Dataset):
         else:
             self._subject_ids = np.arange(self.n_subjects, dtype=np.int64)
 
+        # Same subject order as time series indexing: row k matches self._subject_ids[k].
+        self._adjacency = np.asarray(_adj_full[self._subject_ids], dtype=np.int8)
+
         self._index: list[tuple[int, ...]] = []
         self._build_sample_index()
 
     def _build_sample_index(self) -> None:
         self._index.clear()
         if self.task_mode == "perturbation":
-            self._index.extend((int(s),) for s in self._subject_ids.tolist())
+            self._index.extend((k,) for k in range(len(self._subject_ids)))
             return
 
         T = self.n_bins
-        for s in self._subject_ids.tolist():
+        for k in range(len(self._subject_ids)):
             if self.split == "within":
                 t0 = T - self.x - self.y
                 if t0 >= 0:
-                    self._index.append((s, t0))
+                    self._index.append((k, t0))
             else:
                 last_t = T - self.x - 2 * self.y
                 if last_t < 0:
                     continue
                 for t in range(0, last_t + 1, self.stride):
-                    self._index.append((s, t))
+                    self._index.append((k, t))
 
     def _rates_orig_tc(self, subject: int) -> np.ndarray:
         if self._cache_subject_tc:
@@ -181,11 +187,13 @@ class SNDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         if self.task_mode == "forecasting":
-            s, t = self._index[idx]
+            k, t = self._index[idx]
+            s = int(self._subject_ids[k])
             ts = self._rates_orig_tc(s)
             ctx = ts[t : t + self.x]
             hrz = ts[t + self.x : t + self.x + self.y]
             x_t, y_t = _zscore_with_context_stats(ctx, hrz)
+            adj = torch.from_numpy(self._adjacency[k].copy())
             meta = {
                 "subject_index": int(s),
                 "graph_seed": int(self._graph_seeds[s]),
@@ -193,17 +201,20 @@ class SNDataset(Dataset):
                 "split": self.split,
                 "T": self.n_bins,
                 "n_channels": self.n_channels,
+                "adjacency": adj,
             }
             return {"x": x_t, "y": y_t, "meta": meta}
 
         else:
-            (s,) = self._index[idx]
+            (k,) = self._index[idx]
+            s = int(self._subject_ids[k])
             orig = self._rates_orig_tc(s)
             pert = self._rates_pert_tc(s)
             o_t, p_t = _zscore_pair_from_reference(orig, pert)
             kn = int(self._pert_n[s])
             nodes = torch.from_numpy(self._pert_nodes[s].astype(np.int64).copy())
             mode = self._perturbation_mode or ""
+            adj = torch.from_numpy(self._adjacency[k].copy())
             meta = {
                 "subject_index": int(s),
                 "graph_seed": int(self._graph_seeds[s]),
@@ -215,6 +226,7 @@ class SNDataset(Dataset):
                 "perturbation_mode": mode,
                 "perturbed_n_nodes": torch.tensor(kn, dtype=torch.long),
                 "perturbed_nodes": nodes,
+                "adjacency": adj,
             }
             return {"x_original": o_t, "x_perturbed": p_t, "meta": meta}
 
@@ -275,14 +287,11 @@ def make_dataloaders(
 
 
 if __name__ == "__main__":
-    import argparse
-    import time
-
     ap = argparse.ArgumentParser(description="Unit tests for SNDataset.")
     ap.add_argument("npz_path", nargs="?", default=str(DATA_NPZ_PATH))
     ap.add_argument("--x", type=int, default=90)
     ap.add_argument("--y", type=int, default=30)
-    ap.add_argument("--stride", type=int, default=5)
+    ap.add_argument("--stride", type=int, default=100)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--n-batches", type=int, default=2)
@@ -312,15 +321,21 @@ if __name__ == "__main__":
                 if i == 0:
                     if task_mode == "forecasting":
                         print(
-                            f"{name}: x={tuple(batch['x'].shape)} y={tuple(batch['y'].shape)} "
-                            f"subject={batch['meta']['subject_index']}"
+                            f'{name}: x={tuple(batch["x"].shape)} y={tuple(batch["y"].shape)} '
+                            f'subject={batch["meta"]["subject_index"]}'
+                            f'graph adjacency shape={batch["meta"]["adjacency"].shape}'
                         )
                     else:
                         print(
-                            f"{name}: x_original={tuple(batch['x_original'].shape)} "
-                            f"{name}: x_perturbed={tuple(batch['x_perturbed'].shape)} "
-                            f"metadata={batch['meta']}"
+                            f'{name}: x_original={tuple(batch["x_original"].shape)} '
+                            f'{name}: x_perturbed={tuple(batch["x_perturbed"].shape)} '
+                            f'perturbation_start_ms={batch["meta"]["perturbation_start_ms"]}'
+                            f'perturbation_end_ms={batch["meta"]["perturbation_end_ms"]}'
+                            f'perturbation_mode={batch["meta"]["perturbation_mode"]}'
+                            f'perturbed_n_nodes={batch["meta"]["perturbed_n_nodes"]}'
+                            f'perturbed_nodes={batch["meta"]["perturbed_nodes"]}'
+                            f'adjacency shape={batch["meta"]["adjacency"].shape}'
                         )
                 if i + 1 >= args.n_batches:
                     break
-            print(f"{name}: {args.n_batches} batches in {time.perf_counter() - t0:.2f}s")
+            print(f'{name}: {args.n_batches} batches in {time.perf_counter() - t0:.2f}s')
