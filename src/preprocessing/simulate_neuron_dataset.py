@@ -68,6 +68,9 @@ class NestConfig:
     poisson_weight: float = 100.0
     poisson_delay_ms: float = 1.0
     dc_amplitude_pa: float = 300.0
+    noise_mean_pa: float = 0.0
+    noise_std_pa: float = 0.0
+    noise_dt_ms: float = 1.0
     record_to: str = "memory"
     perturbations: list[PerturbationSpec] = field(default_factory=list)
 
@@ -179,21 +182,41 @@ def _build_small_world_graph(cfg: GraphConfig) -> tuple[np.ndarray, np.ndarray]:
             if not cfg.directed:
                 adj[j, i] = 1
 
-    for i in range(n):
-        targets = np.where(adj[i] > 0)[0].tolist()
-        for old_j in targets:
-            if rng.random() < cfg.small_world_beta:
+    # Watts–Strogatz: revisit each lattice edge-slot once with probability beta rewire endpoint.
+    if cfg.directed:
+        for i in range(n):
+            for offset in range(1, half_k + 1):
+                old_j = (i + offset) % n
+                if rng.random() >= cfg.small_world_beta:
+                    continue
                 candidates = [x for x in range(n) if x != i and adj[i, x] == 0]
-                if candidates:
-                    new_j = int(rng.choice(candidates))
-                    adj[i, old_j] = 0
-                    adj[i, new_j] = 1
+                if not candidates:
+                    continue
+                adj[i, old_j] = 0
+                adj[i, int(rng.choice(candidates))] = 1
+    else:
+        for i in range(n):
+            for offset in range(1, half_k + 1):
+                old_j = (i + offset) % n
+                if rng.random() >= cfg.small_world_beta:
+                    continue
+                if adj[i, old_j] == 0:
+                    continue
+                candidates = [
+                    x
+                    for x in range(n)
+                    if x != i and adj[i, x] == 0 and adj[x, i] == 0
+                ]
+                if not candidates:
+                    continue
+                adj[i, old_j] = 0
+                adj[old_j, i] = 0
+                new_j = int(rng.choice(candidates))
+                adj[i, new_j] = 1
+                adj[new_j, i] = 1
 
     if not cfg.allow_self_edges:
         np.fill_diagonal(adj, 0)
-
-    if not cfg.directed:
-        adj = np.logical_or(adj, adj.T).astype(np.int8)
 
     weights = adj.astype(np.float32)
     return adj, weights
@@ -268,6 +291,30 @@ def add_input_drive(neurons, nest_cfg: NestConfig):
         return generator
 
     raise ValueError(f"Unknown input_type: {nest_cfg.input_type}")
+
+
+def _nest_grid_dt_ms(dt_ms: float, resolution_ms: float) -> float:
+    """NEST ``noise_generator`` ``dt`` must be a multiple of the simulation resolution."""
+    res = float(resolution_ms)
+    if res <= 0.0:
+        return float(dt_ms)
+    n = max(1, int(round(float(dt_ms) / res)))
+    return n * res
+
+
+def add_noise_current(neurons, nest_cfg: NestConfig) -> None:
+    if nest_cfg.noise_std_pa <= 0.0:
+        return
+    dt = _nest_grid_dt_ms(float(nest_cfg.noise_dt_ms), float(nest_cfg.resolution_ms))
+    gen = nest.Create(
+        "noise_generator",
+        params={
+            "mean": float(nest_cfg.noise_mean_pa),
+            "std": float(nest_cfg.noise_std_pa),
+            "dt": dt,
+        },
+    )
+    nest.Connect(gen, neurons)
 
 
 def _nest_grid_time_ms(t_ms: float, resolution_ms: float) -> float:
@@ -512,6 +559,7 @@ def nest_simulation_raw_counts(cfg: FullConfig) -> dict[str, Any]:
     neurons = create_neurons(cfg.graph.n_nodes, cfg.nest)
     connect_graph_edges(neurons, adjacency, graph_weights, cfg.nest)
     add_input_drive(neurons, cfg.nest)
+    add_noise_current(neurons, cfg.nest)
     add_perturbation_inputs(neurons, cfg.nest)
     spike_recorder = attach_spike_recorder(neurons, cfg.nest)
 
@@ -982,6 +1030,7 @@ def simulate_bulk_neuron_dataset(
         "bin_edges_ms": bin_edges_ms.astype(np.float64),
         "graph_seeds": graph_seeds,
         "adjacency": adjacency.astype(np.int8),
+        "bin_size_ms": base_cfg.processing.bin_size_ms,
         "perturbation_start_ms": pert_start_ms,
         "perturbation_end_ms": pert_end_ms,
         "perturbation_n_nodes": pert_n_nodes,
@@ -1036,6 +1085,9 @@ def _full_config_from_args(args: argparse.Namespace) -> FullConfig:
         poisson_weight=args.poisson_weight,
         poisson_delay_ms=args.poisson_delay_ms,
         dc_amplitude_pa=args.dc_amplitude_pa,
+        noise_mean_pa=args.noise_mean_pa,
+        noise_std_pa=args.noise_std_pa,
+        noise_dt_ms=args.noise_dt_ms,
         record_to=args.record_to,
         perturbations=[],
     )
@@ -1050,15 +1102,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate a NEST dataset where each graph node is one neuron.")
 
     p.add_argument("--n-nodes", type=int, default=100)
-    p.add_argument("--graph-rule", type=str, default="small_world",
-                   choices=["knn", "distance", "erdos_renyi", "small_world"])
+    p.add_argument("--graph-rule", type=str, default="small_world", choices=["knn", "distance", "erdos_renyi", "small_world"])
     p.add_argument("--dim", type=int, default=2)
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Base seed: subject s uses graph seed (seed + s); per-subject perturbation draws use a spawned stream.",
-    )
+    p.add_argument("--seed", type=int, default=0, help="Base seed: subject s uses graph seed (seed + s); per-subject perturbation draws use a spawned stream.")
     p.add_argument("--k", type=int, default=8)
     p.add_argument("--radius", type=float, default=0.25)
     p.add_argument("--p-connect", type=float, default=0.05)
@@ -1080,6 +1126,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--poisson-weight", type=float, default=100.0)
     p.add_argument("--poisson-delay-ms", type=float, default=1.0)
     p.add_argument("--dc-amplitude-pa", type=float, default=300.0)
+    p.add_argument("--noise-mean-pa", type=float, default=0.0, help="noise_generator mean current (pA); only used if --noise-std-pa > 0")
+    p.add_argument("--noise-std-pa", type=float, default=100.0, help="noise_generator std (pA); 0 disables NEST current noise (default).")
+    p.add_argument("--noise-dt-ms", type=float, default=1.0, help="noise_generator update interval (ms); snapped to a multiple of --resolution-ms.")
 
     p.add_argument("--record-to", type=str, default="memory", choices=["memory", "ascii", "none"])
     p.add_argument("--bin-size-ms", type=float, default=10.0)

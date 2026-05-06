@@ -111,6 +111,7 @@ class SNDataset(Dataset):
         self._npz = np.load(path, mmap_mode=mmap, allow_pickle=True)
         self._rates_o = self._npz["smoothed_rates_hz_original"]
         self._rates_p = self._npz["smoothed_rates_hz_perturbed"]
+        self._bin_size_ms = self._npz["bin_size_ms"]
 
         self.n_subjects, self.n_channels, self.n_bins = (int(self._rates_o.shape[i]) for i in range(3))
 
@@ -150,16 +151,23 @@ class SNDataset(Dataset):
 
         T = self.n_bins
         for s in self._subject_ids.tolist():
-            if self.split == "within":
-                t0 = T - self.x - self.y
-                if t0 >= 0:
-                    self._index.append((s, t0))
+            if self.task_mode == "perturb_forecast":
+                pert_start = self._pert_start[s]
+                t0 = max(0, int(pert_start / self._bin_size_ms - self.x // 5))
+                t0 = min(t0, T - self.x - self.y)
+                self._index.append((s, t0))
+
             else:
-                last_t = T - self.x - 2 * self.y
-                if last_t < 0:
-                    continue
-                for t in range(0, last_t + 1, self.stride):
-                    self._index.append((s, t))
+                if self.split == "within":
+                    t0 = T - self.x - self.y
+                    if t0 >= 0:
+                        self._index.append((s, t0))
+                else:
+                    last_t = T - self.x - self.y
+                    if last_t < 0:
+                        continue
+                    for t in range(0, last_t + 1, self.stride):
+                        self._index.append((s, t))
 
     def _rates_orig_tc(self, subject: int) -> np.ndarray:
         if self._cache_subject_tc:
