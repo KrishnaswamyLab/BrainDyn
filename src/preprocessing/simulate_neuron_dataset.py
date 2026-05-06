@@ -26,6 +26,19 @@ CHECK_SIMULATED_NEURON_DIR = os.path.join(os.path.dirname(os.path.realpath(__fil
 # Config (neuron-graph run only)
 # ---------------------------------------------------------------------------
 
+_DEFAULT_IAF_NEURON_PARAMS: dict[str, Any] = {
+    "C_m": 250.0,
+    "tau_m": 20.0,
+    "t_ref": 2.0,
+    "E_L": -70.0,
+    "V_reset": -70.0,
+    "V_th": -55.0,
+}
+
+
+def _default_iaf_neuron_params() -> dict[str, Any]:
+    return dict(_DEFAULT_IAF_NEURON_PARAMS)
+
 
 @dataclass
 class PerturbationSpec:
@@ -55,17 +68,29 @@ class GraphConfig:
 
 @dataclass
 class NestConfig:
+    """NEST wiring.
+
+    ``neuron_params`` defaults match ``DEPRECATED_create_IF_neuron_dataset.py``. Shared Poisson
+    defaults are strong enough to evoke spikes (that script used 8000 Hz @ weight 1); tune down if too synched.
+    """
+    """NEST wiring aligned with ``DEPRECATED_create_IF_neuron_dataset.py``.
+
+    Poisson drive matches that script (8000 Hz, synaptic weight 1.0 on Poisson connections).
+    Recurrent edges use a single positive ``synapse_weight`` (= deprecated ``J_exc`` = 1.2); there is
+    no separate inhibitory population or ``J_inh`` until the simulator gains E/I wiring.
+    """
+
     neuron_model: str = "iaf_psc_alpha"
-    neuron_params: dict[str, Any] | None = None
+    neuron_params: dict[str, Any] = field(default_factory=_default_iaf_neuron_params)
     resolution_ms: float = 0.1
     local_num_threads: int = 1
     simulation_time_ms: float = 1000.0
-    synapse_weight: float = 1.0
+    synapse_weight: float = 100.0
     synapse_delay_ms: float = 1.5
     use_graph_weights: bool = False
     input_type: str = "poisson"
     poisson_rate_hz: float = 800.0
-    poisson_weight: float = 100.0
+    poisson_weight: float = 80.0
     poisson_delay_ms: float = 1.0
     dc_amplitude_pa: float = 300.0
     noise_mean_pa: float = 0.0
@@ -746,6 +771,50 @@ def write_check_original_vs_perturbed_panels(
     return out_path
 
 
+def write_voltage_sample_panels(
+    vm_diag: dict[str, Any],
+    check_dir: str,
+    n_plot_exc: int = 3,
+    n_plot_inh: int = 2,
+    figsize: Tuple[float, float] = (10.0, 7.0),
+    dpi: int = 120,
+    panels_name: str = "voltage_sample_traces.png",
+) -> str:
+    """Plot sample ``V_m`` traces for excitatory (first indices) and inhibitory units."""
+    t = np.asarray(vm_diag["voltage_times_ms"], dtype=np.float64)
+    V = np.asarray(vm_diag["voltage_vm_mv"], dtype=np.float64)
+    n_exc = int(vm_diag["n_exc"])
+    n_inh = int(vm_diag["n_inh"])
+    n_exc_plot = min(n_plot_exc, n_exc)
+    n_inh_plot = min(n_plot_inh, n_inh)
+    n_rows = n_exc_plot + n_inh_plot
+    if n_rows < 1:
+        raise ValueError("voltage_vm_mv has no rows to plot")
+
+    fig, axs = plt.subplots(n_rows, 1, sharex=True, figsize=figsize)
+    ax_list = [axs] if n_rows == 1 else list(axs)
+    row = 0
+    for i in range(n_exc_plot):
+        ax_list[row].plot(t, V[i], color="C0", lw=0.8, alpha=0.9)
+        ax_list[row].set_ylabel("mV", fontsize=8)
+        ax_list[row].set_title(f"Excitatory index {i}", fontsize=9)
+        row += 1
+    for j in range(n_inh_plot):
+        idx = n_exc + j
+        ax_list[row].plot(t, V[idx], color="C3", lw=0.8, alpha=0.9)
+        ax_list[row].set_ylabel("mV", fontsize=8)
+        ax_list[row].set_title(f"Inhibitory index {idx}", fontsize=9)
+        row += 1
+    ax_list[-1].set_xlabel("Time (ms)")
+    fig.suptitle("Membrane potential (baseline simulation)", fontsize=10, y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    os.makedirs(check_dir, exist_ok=True)
+    out_path = os.path.join(check_dir, panels_name)
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def _plot_graph_structure(
     output: str | dict[str, np.ndarray],
     max_edges_sample: int = 400,
@@ -1117,17 +1186,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resolution-ms", type=float, default=0.1)
     p.add_argument("--threads", type=int, default=1)
     p.add_argument("--simulation-time-ms", type=float, default=2000.0)
-    p.add_argument("--synapse-weight", type=float, default=5.0)
-    p.add_argument("--synapse-delay-ms", type=float, default=1.5)
     p.add_argument("--use-graph-weights", action="store_true")
 
     p.add_argument("--input-type", type=str, default="poisson", choices=["poisson", "dc", "none"])
-    p.add_argument("--poisson-rate-hz", type=float, default=800.0)
-    p.add_argument("--poisson-weight", type=float, default=100.0)
+    p.add_argument("--poisson-rate-hz", type=float, default=1000.0, help="shared Poisson rate (Hz) onto each neuron; lower can silence output")
+    p.add_argument("--poisson-weight", type=float, default=50.0)
+    p.add_argument("--synapse-weight", type=float, default=50.0)
     p.add_argument("--poisson-delay-ms", type=float, default=1.0)
-    p.add_argument("--dc-amplitude-pa", type=float, default=300.0)
+    p.add_argument("--synapse-delay-ms", type=float, default=1.5)
+    p.add_argument("--dc-amplitude-pa", type=float, default=0.0)
     p.add_argument("--noise-mean-pa", type=float, default=0.0, help="noise_generator mean current (pA); only used if --noise-std-pa > 0")
-    p.add_argument("--noise-std-pa", type=float, default=100.0, help="noise_generator std (pA); 0 disables NEST current noise (default).")
+    p.add_argument("--noise-std-pa", type=float, default=10.0, help="noise_generator std (pA); 0 disables (default); >0 adds intrinsic current noise")
     p.add_argument("--noise-dt-ms", type=float, default=1.0, help="noise_generator update interval (ms); snapped to a multiple of --resolution-ms.")
 
     p.add_argument("--record-to", type=str, default="memory", choices=["memory", "ascii", "none"])
