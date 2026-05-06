@@ -153,7 +153,7 @@ class SNDataset(Dataset):
         for s in self._subject_ids.tolist():
             if self.task_mode == "perturb_forecast":
                 pert_start = self._pert_start[s]
-                t0 = max(0, int(pert_start / self._bin_size_ms - self.x // 3))
+                t0 = max(0, int(pert_start / self._bin_size_ms - self.x / 10))
                 t0 = min(t0, T - self.x - self.y)
                 self._index.append((s, t0))
 

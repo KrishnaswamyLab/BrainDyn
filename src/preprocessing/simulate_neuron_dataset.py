@@ -46,9 +46,9 @@ class PerturbationSpec:
     nodes: list[int]
     start_ms: float
     end_ms: float
-    extra_rate_hz: float = 1500.0
+    extra_rate_hz: float = 120.0
     extra_weight: float | None = None
-    scale: float = 2.0
+    scale: float = 1.0
 
 
 @dataclass
@@ -68,17 +68,7 @@ class GraphConfig:
 
 @dataclass
 class NestConfig:
-    """NEST wiring.
-
-    ``neuron_params`` defaults match ``DEPRECATED_create_IF_neuron_dataset.py``. Shared Poisson
-    defaults are strong enough to evoke spikes (that script used 8000 Hz @ weight 1); tune down if too synched.
-    """
-    """NEST wiring aligned with ``DEPRECATED_create_IF_neuron_dataset.py``.
-
-    Poisson drive matches that script (8000 Hz, synaptic weight 1.0 on Poisson connections).
-    Recurrent edges use a single positive ``synapse_weight`` (= deprecated ``J_exc`` = 1.2); there is
-    no separate inhibitory population or ``J_inh`` until the simulator gains E/I wiring.
-    """
+    """NEST wiring: neuron model, Poisson/dc drive, recurrent synapses, optional perturbation tuning."""
 
     neuron_model: str = "iaf_psc_alpha"
     neuron_params: dict[str, Any] = field(default_factory=_default_iaf_neuron_params)
@@ -98,6 +88,9 @@ class NestConfig:
     noise_dt_ms: float = 1.0
     record_to: str = "memory"
     perturbations: list[PerturbationSpec] = field(default_factory=list)
+    extra_poisson_rate_hz: float = 120.0
+    extra_poisson_weight: float | None = None
+    scale_bins_factor: float = 0.9
 
 
 @dataclass
@@ -716,11 +709,12 @@ def write_check_original_vs_perturbed_panels(
     n_plot_nodes: int = 5,
     seed: int = 0,
     center_fraction: float = 0.5,
+    pin_nodes: Optional[Sequence[int]] = None,
     figsize: Optional[Tuple[float, float]] = None,
     dpi: int = 120,
     panels_name: str = "smoothed_sample_panels.png",
 ) -> str:
-    """Solid = original, dashed = perturbed (same random subset of units as middle-window panels)."""
+    """Solid = original, dashed = perturbed. If ``pin_nodes`` is set, those units are always plotted."""
     rates_orig = np.asarray(rates_orig, dtype=np.float64)
     rates_pert = np.asarray(rates_pert, dtype=np.float64)
     n_units, n_bins = rates_orig.shape
@@ -730,7 +724,25 @@ def write_check_original_vs_perturbed_panels(
         raise ValueError(f"n_plot_nodes ({n_plot_nodes}) > n_units ({n_units})")
 
     rng = np.random.default_rng(seed)
-    node_indices = np.sort(rng.choice(n_units, size=n_plot_nodes, replace=False))
+    k = min(n_plot_nodes, n_units)
+    pinned: list[int] = []
+    for x in pin_nodes or []:
+        xi = int(x)
+        if 0 <= xi < n_units:
+            pinned.append(xi)
+    pinned = list(dict.fromkeys(pinned))
+    if len(pinned) >= k:
+        node_indices = np.sort(np.asarray(pinned[:k], dtype=int))
+    elif pinned:
+        rest_pool = [i for i in range(n_units) if i not in pinned]
+        need = k - len(pinned)
+        if need > 0 and len(rest_pool) > 0:
+            extra = rng.choice(rest_pool, size=min(need, len(rest_pool)), replace=False)
+            node_indices = np.sort(np.concatenate([np.asarray(pinned, dtype=int), extra]))
+        else:
+            node_indices = np.sort(np.asarray(pinned, dtype=int))
+    else:
+        node_indices = np.sort(rng.choice(n_units, size=k, replace=False))
 
     t_full = _bin_centers_ms(np.asarray(bin_edges_ms, dtype=np.float64))
     if t_full.shape[0] != n_bins:
@@ -757,8 +769,9 @@ def write_check_original_vs_perturbed_panels(
         ax.set_title(f"Node {int(idx)}", fontsize=10)
     ax_list[-1].set_xlabel("Time (ms)")
     ax_list[0].legend(loc="upper right", fontsize=8)
+    win_desc = "full timeline" if center_fraction >= 0.999 else "middle of timeline"
     fig.suptitle(
-        "Smoothed rate — original (solid) vs perturbed (dashed), middle of timeline",
+        f"Smoothed rate — original (solid) vs perturbed (dashed), {win_desc}",
         y=0.999,
         fontsize=10,
     )
@@ -1007,6 +1020,8 @@ def _write_check_artifacts_subject_zero(
         check_dir,
         n_plot_nodes=min(5, n_nodes),
         seed=int(graph_seed),
+        center_fraction=1.0,
+        pin_nodes=spec.nodes,
     )
     p_graph = _write_graph_structure_plot(
         check_arrays,
@@ -1061,6 +1076,12 @@ def simulate_bulk_neuron_dataset(
             cfg.nest.simulation_time_ms,
             perturbation_mode,
         )
+        if perturbation_mode == "extra_poisson":
+            spec = replace(spec, extra_rate_hz=float(cfg.nest.extra_poisson_rate_hz))
+            if cfg.nest.extra_poisson_weight is not None:
+                spec = replace(spec, extra_weight=float(cfg.nest.extra_poisson_weight))
+        elif perturbation_mode == "scale_bins":
+            spec = replace(spec, scale=float(cfg.nest.scale_bins_factor))
         _validate_perturbations([spec], n_nodes, cfg.nest.simulation_time_ms)
 
         ro, rp, edges, adj = run_paired_smoothed_rates_hz(cfg, spec, perturbation_mode)
@@ -1159,6 +1180,9 @@ def _full_config_from_args(args: argparse.Namespace) -> FullConfig:
         noise_dt_ms=args.noise_dt_ms,
         record_to=args.record_to,
         perturbations=[],
+        extra_poisson_rate_hz=args.extra_poisson_rate_hz,
+        extra_poisson_weight=args.extra_poisson_weight,
+        scale_bins_factor=args.scale_bins_factor,
     )
     processing = ProcessingConfig(
         bin_size_ms=args.bin_size_ms,
@@ -1191,12 +1215,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--input-type", type=str, default="poisson", choices=["poisson", "dc", "none"])
     p.add_argument("--poisson-rate-hz", type=float, default=1000.0, help="shared Poisson rate (Hz) onto each neuron; lower can silence output")
     p.add_argument("--poisson-weight", type=float, default=50.0)
-    p.add_argument("--synapse-weight", type=float, default=50.0)
+    p.add_argument("--synapse-weight", type=float, default=10.0)
     p.add_argument("--poisson-delay-ms", type=float, default=1.0)
     p.add_argument("--synapse-delay-ms", type=float, default=1.5)
     p.add_argument("--dc-amplitude-pa", type=float, default=0.0)
     p.add_argument("--noise-mean-pa", type=float, default=0.0, help="noise_generator mean current (pA); only used if --noise-std-pa > 0")
-    p.add_argument("--noise-std-pa", type=float, default=10.0, help="noise_generator std (pA); 0 disables (default); >0 adds intrinsic current noise")
+    p.add_argument("--noise-std-pa", type=float, default=5.0, help="noise_generator std (pA); 0 disables (default); >0 adds intrinsic current noise")
     p.add_argument("--noise-dt-ms", type=float, default=1.0, help="noise_generator update interval (ms); snapped to a multiple of --resolution-ms.")
 
     p.add_argument("--record-to", type=str, default="memory", choices=["memory", "ascii", "none"])
@@ -1204,7 +1228,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smoothing-sigma-ms", type=float, default=20.0)
 
     p.add_argument("--num-simulations", type=int, default=1000)
-    p.add_argument("--perturbation-mode", type=str, default="extra_poisson", choices=sorted(PERTURBATION_MODES))
+    p.add_argument("--perturbation-mode", type=str, default="mute_bins", choices=sorted(PERTURBATION_MODES))
+    p.add_argument("--extra-poisson-rate-hz", type=float, default=1000.0)
+    p.add_argument("--extra-poisson-weight", type=float, default=None)
+    p.add_argument("--scale-bins-factor", type=float, default=1.0)
     return p.parse_args()
 
 

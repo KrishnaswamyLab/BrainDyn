@@ -624,6 +624,20 @@ def main() -> None:
                 perturb=False,
                 perturb_train_frac=0.0,
             )
+            perturb_metrics = run_perturbation_epoch(
+                model=model,
+                loader=fold_val_loader,
+                edge_index=edge_index,
+                dt=args.dt,
+                optimizer=None,
+                lambda_mse=args.lambda_mse,
+                lambda_mae=args.lambda_mae,
+                grad_clip=args.grad_clip,
+                use_amp=use_amp,
+                desc=f"fold {fold_idx + 1} val [{epoch}/{args.epochs}]",
+                perturb=True,
+                perturb_train_frac=0.0,
+            )
             val_total = float(val_metrics["total"])
             if math.isfinite(val_total):
                 scheduler_perturbation.step(val_total)
@@ -633,7 +647,9 @@ def main() -> None:
                 f"train total={train_metrics['total']:.4f} mse={train_metrics['mse']:.4f} mae={train_metrics['mae']:.4f} "
                 f"pcc={train_metrics['pcc']:.4f} scc={train_metrics['scc']:.4f} dtw={train_metrics['dtw']:.4f} | "
                 f"val total={val_metrics['total']:.4f} mse={val_metrics['mse']:.4f} mae={val_metrics['mae']:.4f} "
-                f"pcc={val_metrics['pcc']:.4f} scc={val_metrics['scc']:.4f} dtw={val_metrics['dtw']:.4f}"
+                f"pcc={val_metrics['pcc']:.4f} scc={val_metrics['scc']:.4f} dtw={val_metrics['dtw']:.4f} | "
+                f"perturb total={perturb_metrics['total']:.4f} mse={perturb_metrics['mse']:.4f} mae={perturb_metrics['mae']:.4f} "
+                f"pcc={perturb_metrics['pcc']:.4f} scc={perturb_metrics['scc']:.4f} dtw={perturb_metrics['dtw']:.4f}"
             )
             if args.debug_lstm_grads and epoch == 1 and model_cfg.use_lstm_encoder:
                 grad_l2, grad_abs_max, n_with_grad, n_missing = lstm_grad_report(model)
