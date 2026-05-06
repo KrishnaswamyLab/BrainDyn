@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from pathlib import Path
 from typing import Dict
 
@@ -122,7 +123,8 @@ def run_perturbation_epoch(
     dtw_running = 0.0
     n_batches = 0
 
-    pbar = tqdm(loader, desc=desc, leave=False)
+    # Slurm / log files are not a TTY: tqdm redraw becomes one line per refresh.
+    pbar = tqdm(loader, desc=desc, leave=False, disable=not sys.stderr.isatty())
     for batch in pbar:
         x_history, y_true = batch_to_model_tensors_nest(batch, edge_index.device, perturb=perturb)
 
