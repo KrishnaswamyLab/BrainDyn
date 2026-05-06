@@ -202,9 +202,10 @@ class SNDataset(Dataset):
             ctx_p = ts_p[t : t + self.x]
             hrz_o = ts_o[t + self.x : t + self.x + self.y]
             hrz_p = ts_p[t + self.x : t + self.x + self.y]
-            x_t, y_t = _zscore_pair_from_reference(ctx_o, hrz_o)
-            _, x_pert_t = _zscore_pair_from_reference(ctx_o, ctx_p)
-            _, y_pert_t = _zscore_pair_from_reference(ctx_o, hrz_p)
+            _, x_t = _zscore_pair_from_reference(ts_o, ctx_o)
+            _, x_pert_t = _zscore_pair_from_reference(ts_o, ctx_p)
+            _, y_t = _zscore_pair_from_reference(ts_o, hrz_o)
+            _, y_pert_t = _zscore_pair_from_reference(ts_o, hrz_p)
             meta = {
                 "subject_index": int(s),
                 "graph_seed": int(self._graph_seeds[s]),
