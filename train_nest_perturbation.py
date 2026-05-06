@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import random
 from pathlib import Path
 from typing import Dict
@@ -29,22 +30,25 @@ def batch_to_model_tensors_nest(
     device: torch.device,
     perturb: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert NEST forecasting batch to BrainDyn shapes.
+    """Convert NEST ``perturb_forecast`` batch to BrainDyn shapes.
 
-    Input batch:
-      x: (B, Lx, N)
-      y: (B, Ly, N)
+    Batches provide ``x`` (unperturbed context), ``y`` (unperturbed horizon), and
+    ``y_perturbed`` (horizon under perturbation), with ``y_*`` scaled using the same
+    context statistics as ``y``. The model always receives ``x``.
+
+    perturb=False — train/eval vs unperturbed ``y``.
+    perturb=True — same ``x``, eval vs ``y_perturbed`` (counterfactual horizon).
+
+    Shapes:
+      x: (B, Lx, N); y / y_perturbed: (B, Ly, N)
 
     Returns:
-      x_history: (B, N, Lx, 1)
-      y_true:    (Ly, B, N, 1)
+      x_history: (B, N, Lx, 1); y_true: (Ly, B, N, 1)
     """
-    if perturb:
-        x_ctx = batch["x_perturbed"].to(device=device, dtype=torch.float32)
-        y_future = batch["y_perturbed"].to(device=device, dtype=torch.float32)
-    else:
-        x_ctx = batch["x_original"].to(device=device, dtype=torch.float32)
-        y_future = batch["y_original"].to(device=device, dtype=torch.float32)
+    x_key = "x_perturbed" if perturb else "x"
+    x_ctx = batch[x_key].to(device=device, dtype=torch.float32)
+    y_key = "y_perturbed" if perturb else "y"
+    y_future = batch[y_key].to(device=device, dtype=torch.float32)
 
     x_history = x_ctx.permute(0, 2, 1).unsqueeze(-1)
     y_true = y_future.permute(1, 0, 2).unsqueeze(-1)
@@ -62,7 +66,7 @@ def collect_node_features_nest(loader: DataLoader, max_batches: int) -> torch.Te
     for batch_idx, batch in enumerate(loader):
         if batch_idx >= max_batches:
             break
-        x_ctx = batch["x_original"].float()  # (B, Lx, N)
+        x_ctx = batch["x"].float()  # (B, Lx, N)
         node_series = x_ctx.permute(2, 0, 1).reshape(x_ctx.shape[2], -1)  # (N, B*Lx)
         chunks.append(node_series)
 
@@ -109,6 +113,7 @@ def run_perturbation_epoch(
     use_amp: bool,
     desc: str,
     perturb: bool,
+    perturb_train_frac: float = 0.0,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -124,7 +129,14 @@ def run_perturbation_epoch(
 
     pbar = tqdm(loader, desc=desc, leave=False)
     for batch in pbar:
-        x_history, y_true = batch_to_model_tensors_nest(batch, edge_index.device, perturb=perturb)
+        use_perturbed_target = perturb
+        if is_train and perturb_train_frac > 0.0:
+            use_perturbed_target = (random.random() < perturb_train_frac)
+        x_history, y_true = batch_to_model_tensors_nest(
+            batch,
+            edge_index.device,
+            perturb=use_perturbed_target,
+        )
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -236,6 +248,7 @@ def evaluate_perturbation_split(
         use_amp=use_amp,
         desc=f"forecast {split_name}",
         perturb=perturb,
+        perturb_train_frac=0.0,
     )
     print(
         f"{split_name.capitalize()} forecast (perturb={perturb}) | total={metrics['total']:.4f} "
@@ -280,9 +293,44 @@ def print_cv_summary(title: str, metrics: list[Dict[str, float]]) -> None:
     print(f"  dtw   : {metric_mean_std(metrics, 'dtw')[0]:.4f} +/- {metric_mean_std(metrics, 'dtw')[1]:.4f}")
 
 
+def lstm_param_report(model: torch.nn.Module) -> tuple[int, int]:
+    total = 0
+    trainable = 0
+    for name, p in model.named_parameters():
+        if "temporal_encoder" in name:
+            n = int(p.numel())
+            total += n
+            if p.requires_grad:
+                trainable += n
+    return total, trainable
+
+
+def lstm_grad_report(model: torch.nn.Module) -> tuple[float, float, int, int]:
+    grad_l2_sq = 0.0
+    grad_abs_max = 0.0
+    n_with_grad = 0
+    n_missing_grad = 0
+    for name, p in model.named_parameters():
+        if "temporal_encoder" not in name:
+            continue
+        if p.grad is None:
+            n_missing_grad += 1
+            continue
+        g = p.grad.detach()
+        grad_l2_sq += float(torch.sum(g * g).item())
+        gmax = float(g.abs().max().item()) if g.numel() > 0 else 0.0
+        if gmax > grad_abs_max:
+            grad_abs_max = gmax
+        n_with_grad += 1
+    return float(grad_l2_sq**0.5), grad_abs_max, n_with_grad, n_missing_grad
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Train BrainDyn on unperturbed simulated NEST trajectories for forecasting.",
+        description=(
+            "Train BrainDyn on unperturbed NEST horizons (x, y); report test metrics vs "
+            "perturbed horizons (x_perturbed, y_perturbed) from perturb_forecast windows."
+        ),
     )
 
     ap.add_argument("--npz_path", type=str, default=str(DATA_NPZ_PATH))
@@ -293,9 +341,24 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--train_frac", type=float, default=0.8)
     ap.add_argument("--val_frac", type=float, default=0.1)
     ap.add_argument("--split_seed", type=int, default=0)
-    ap.add_argument("--cv_folds", type=int, default=3, help="Number of cross-validation folds over the combined forecasting train+val pool.")
+    ap.add_argument(
+        "--cv_folds",
+        type=int,
+        default=3,
+        help=(
+            "CV folds over shuffled train+val windows; use 1 for a single split "
+            "(all original-train indices vs original-val indices, reshuffled)—matches baselines/sn_perturb scripts."
+        ),
+    )
+    ap.add_argument(
+        "--fold",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Run only CV fold K (1-based: 1..cv_folds). Use with SLURM array jobs; omit to run every fold sequentially.",
+    )
 
-    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--cache", action="store_true", help="Cache arrays in RAM (instead of memory mapping).")
     ap.add_argument("--no_pin_memory", action="store_true")
@@ -311,15 +374,42 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ablation_no_lstm", action="store_true")
     ap.add_argument("--precompute_lap_h", action="store_true")
 
-    ap.add_argument("--fc_threshold", type=float, default=0.3)
-    ap.add_argument("--fc_max_batches", type=int, default=30)
+    ap.add_argument(
+        "--fc_threshold",
+        type=float,
+        default=0.5,
+        help="Pearson threshold for FC edges (aligned with train_baseline_sn_perturb / ritini perturb script).",
+    )
+    ap.add_argument(
+        "--fc_max_batches",
+        type=int,
+        default=8,
+        help="Max train batches when estimating FC correlations (baseline default).",
+    )
 
-    ap.add_argument("--epochs", "--epochs_forecast", dest="epochs", type=int, default=60)
+    ap.add_argument("--epochs", "--epochs_forecast", dest="epochs", type=int, default=100)
     ap.add_argument("--lr", "--lr_forecast", dest="lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-5)
+    ap.add_argument(
+        "--plateau_patience",
+        type=int,
+        default=2,
+        help="ReduceLROnPlateau patience (matches train_baseline_sn_perturb).",
+    )
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--lambda_mse", type=float, default=1.0)
     ap.add_argument("--lambda_mae", type=float, default=0.0)
+    ap.add_argument(
+        "--debug_lstm_grads",
+        action="store_true",
+        help="Print LSTM parameter counts and post-epoch-1 gradient stats.",
+    )
+    ap.add_argument(
+        "--perturb_train_frac",
+        type=float,
+        default=0.0,
+        help="Fraction of train batches supervised with y_perturbed (0.0-1.0).",
+    )
 
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
@@ -335,6 +425,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if not (0.0 <= args.perturb_train_frac <= 1.0):
+        raise ValueError(f"--perturb_train_frac must be in [0, 1], got {args.perturb_train_frac}")
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -347,7 +439,7 @@ def main() -> None:
 
     perturbation_loaders = make_dataloaders(
         npz_path=str(npz_path),
-        task_mode="perturbation",
+        task_mode="perturb_forecast",
         x=args.x,
         y=args.y,
         stride=args.stride,
@@ -357,7 +449,7 @@ def main() -> None:
         val_frac=args.val_frac,
         split_seed=args.split_seed,
         cache=args.cache,
-        pin_memory=(not args.no_pin_memory),
+        pin_memory=False,
         verbose=True,
     )
 
@@ -369,12 +461,14 @@ def main() -> None:
     n_nodes = int(train_loader.dataset.n_channels)
 
     combined_dataset = ConcatDataset([train_loader.dataset, val_loader.dataset])
-    if args.cv_folds < 2:
-        raise ValueError(f"cv_folds must be >= 2, got {args.cv_folds}")
-    if len(combined_dataset) < args.cv_folds:
+    if args.cv_folds < 1:
+        raise ValueError(f"cv_folds must be >= 1, got {args.cv_folds}")
+    if args.cv_folds > 1 and len(combined_dataset) < args.cv_folds:
         raise ValueError(
             f"Not enough combined train+val samples ({len(combined_dataset)}) for {args.cv_folds}-fold CV"
         )
+    if len(combined_dataset) < 1:
+        raise ValueError("Empty combined train+val dataset.")
 
     save_path = Path(args.save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -382,17 +476,48 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     all_indices = np.arange(len(combined_dataset))
     rng.shuffle(all_indices)
-    fold_indices = np.array_split(all_indices, args.cv_folds)
+    fold_indices = (
+        np.array_split(all_indices, args.cv_folds) if args.cv_folds > 1 else None
+    )
 
-    print(f"\n=== Unperturbed Forecasting (NEST, {args.cv_folds}-fold CV) ===")
+    if args.fold is not None:
+        if not (1 <= args.fold <= args.cv_folds):
+            raise ValueError(
+                f"--fold must satisfy 1 <= --fold <= --cv_folds (cv_folds={args.cv_folds}), got fold={args.fold}"
+            )
+        fold_iteration = [args.fold - 1]
+        fold_selector_desc = f"single fold {args.fold}/{args.cv_folds} only"
+    else:
+        fold_iteration = list(range(args.cv_folds))
+        fold_selector_desc = None
+
+    cv_desc = (
+        "1-fold (fixed train-vs-val partition on shuffled pooled indices)"
+        if args.cv_folds == 1
+        else f"{args.cv_folds}-fold CV"
+    )
+    if fold_selector_desc:
+        cv_desc = f"{cv_desc}; {fold_selector_desc}"
+    print(
+        f"\n=== NEST perturb_forecast: train/val on unperturbed y; test vs y and y_perturbed "
+        f"({cv_desc}) ==="
+    )
 
     fold_val_metrics: list[Dict[str, float]] = []
     fold_test_metrics: list[Dict[str, float]] = []
     fold_infer_metrics: list[Dict[str, float]] = []
 
-    for fold_idx in range(args.cv_folds):
-        val_idx = fold_indices[fold_idx]
-        train_idx = np.concatenate([fold_indices[i] for i in range(args.cv_folds) if i != fold_idx])
+    for fold_idx in fold_iteration:
+        if args.cv_folds == 1:
+            n_tr = len(train_loader.dataset)
+            train_idx = all_indices[:n_tr]
+            val_idx = all_indices[n_tr:] if n_tr < len(all_indices) else all_indices
+        else:
+            assert fold_indices is not None
+            val_idx = fold_indices[fold_idx]
+            train_idx = np.concatenate(
+                [fold_indices[i] for i in range(args.cv_folds) if i != fold_idx]
+            )
 
         fold_train_loader = make_subset_loader(
             dataset=combined_dataset,
@@ -440,7 +565,17 @@ def main() -> None:
             use_lstm_encoder=(not args.ablation_no_lstm),
             precompute_lap_h=args.precompute_lap_h,
         )
+        print(
+            f"Fold {fold_idx + 1}/{args.cv_folds} | model config: "
+            f"use_lstm_encoder={model_cfg.use_lstm_encoder} use_gat={model_cfg.use_gat}"
+        )
         model = BrainDyn(model_cfg).to(device)
+        if args.debug_lstm_grads:
+            total_lstm, trainable_lstm = lstm_param_report(model)
+            print(
+                f"Fold {fold_idx + 1}/{args.cv_folds} | LSTM params: "
+                f"total={total_lstm} trainable={trainable_lstm}"
+            )
 
         optimizer_perturbation = torch.optim.AdamW(
             model.parameters(),
@@ -451,12 +586,15 @@ def main() -> None:
             optimizer_perturbation,
             mode="min",
             factor=0.5,
-            patience=3,
+            patience=args.plateau_patience,
             min_lr=1e-6,
         )
 
         best_val_perturbation = float("inf")
         fold_save_path = save_path.with_name(f"{save_path.stem}_fold{fold_idx + 1}{save_path.suffix}")
+        if fold_save_path.is_file():
+            fold_save_path.unlink()
+        fold_ckpt_written = False
         for epoch in range(1, args.epochs + 1):
             train_metrics = run_perturbation_epoch(
                 model=model,
@@ -470,6 +608,7 @@ def main() -> None:
                 use_amp=use_amp,
                 desc=f"fold {fold_idx + 1} train [{epoch}/{args.epochs}]",
                 perturb=False,
+                perturb_train_frac=args.perturb_train_frac,
             )
             val_metrics = run_perturbation_epoch(
                 model=model,
@@ -483,22 +622,48 @@ def main() -> None:
                 use_amp=use_amp,
                 desc=f"fold {fold_idx + 1} val [{epoch}/{args.epochs}]",
                 perturb=False,
+                perturb_train_frac=0.0,
             )
-            scheduler_perturbation.step(val_metrics["total"])
+            perturb_metrics = run_perturbation_epoch(
+                model=model,
+                loader=fold_val_loader,
+                edge_index=edge_index,
+                dt=args.dt,
+                optimizer=None,
+                lambda_mse=args.lambda_mse,
+                lambda_mae=args.lambda_mae,
+                grad_clip=args.grad_clip,
+                use_amp=use_amp,
+                desc=f"fold {fold_idx + 1} val [{epoch}/{args.epochs}]",
+                perturb=True,
+                perturb_train_frac=0.0,
+            )
+            val_total = float(val_metrics["total"])
+            if math.isfinite(val_total):
+                scheduler_perturbation.step(val_total)
 
             print(
                 f"Fold {fold_idx + 1}/{args.cv_folds} Epoch {epoch:03d} | "
                 f"train total={train_metrics['total']:.4f} mse={train_metrics['mse']:.4f} mae={train_metrics['mae']:.4f} "
                 f"pcc={train_metrics['pcc']:.4f} scc={train_metrics['scc']:.4f} dtw={train_metrics['dtw']:.4f} | "
                 f"val total={val_metrics['total']:.4f} mse={val_metrics['mse']:.4f} mae={val_metrics['mae']:.4f} "
-                f"pcc={val_metrics['pcc']:.4f} scc={val_metrics['scc']:.4f} dtw={val_metrics['dtw']:.4f}"
+                f"pcc={val_metrics['pcc']:.4f} scc={val_metrics['scc']:.4f} dtw={val_metrics['dtw']:.4f} | "
+                f"perturb total={perturb_metrics['total']:.4f} mse={perturb_metrics['mse']:.4f} mae={perturb_metrics['mae']:.4f} "
+                f"pcc={perturb_metrics['pcc']:.4f} scc={perturb_metrics['scc']:.4f} dtw={perturb_metrics['dtw']:.4f}"
             )
+            if args.debug_lstm_grads and epoch == 1 and model_cfg.use_lstm_encoder:
+                grad_l2, grad_abs_max, n_with_grad, n_missing = lstm_grad_report(model)
+                print(
+                    f"Fold {fold_idx + 1}/{args.cv_folds} Epoch 001 | LSTM grad stats: "
+                    f"l2={grad_l2:.6e} abs_max={grad_abs_max:.6e} "
+                    f"params_with_grad={n_with_grad} params_missing_grad={n_missing}"
+                )
 
-            if val_metrics["total"] < best_val_perturbation:
-                best_val_perturbation = val_metrics["total"]
+            if math.isfinite(val_total) and val_total < best_val_perturbation:
+                best_val_perturbation = val_total
                 torch.save(
                     {
-                        "stage": "perturbation_forecasting",
+                        "stage": "perturb_forecast_unperturbed_y",
                         "model_state": model.state_dict(),
                         "edge_index": edge_index.detach().cpu(),
                         "args": vars(args),
@@ -507,9 +672,32 @@ def main() -> None:
                     },
                     fold_save_path,
                 )
+                fold_ckpt_written = True
                 print(f"Saved fold {fold_idx + 1} best forecasting checkpoint -> {fold_save_path}")
 
-        state = torch.load(fold_save_path, map_location=device)
+        if not fold_ckpt_written:
+            torch.save(
+                {
+                    "stage": "perturb_forecast_unperturbed_y",
+                    "model_state": model.state_dict(),
+                    "edge_index": edge_index.detach().cpu(),
+                    "args": vars(args),
+                    "val_metrics": None,
+                    "fold": fold_idx + 1,
+                    "note": "fallback_no_finite_val_improvement",
+                },
+                fold_save_path,
+            )
+            print(
+                f"Saved fold {fold_idx + 1} fallback checkpoint (no finite val improvement) "
+                f"-> {fold_save_path}",
+                flush=True,
+            )
+
+        try:
+            state = torch.load(fold_save_path, map_location=device, weights_only=False)
+        except TypeError:
+            state = torch.load(fold_save_path, map_location=device)
         model.load_state_dict(state["model_state"])
 
         best_val_metrics = evaluate_perturbation_split(
@@ -533,7 +721,7 @@ def main() -> None:
             lambda_mae=args.lambda_mae,
             grad_clip=args.grad_clip,
             use_amp=use_amp,
-            split_name=f"fold {fold_idx + 1} test",
+            split_name=f"fold {fold_idx + 1} test (unperturbed y)",
             perturb=False,
         )
         infer_metrics = evaluate_perturbation_split(
@@ -545,16 +733,16 @@ def main() -> None:
             lambda_mae=args.lambda_mae,
             grad_clip=args.grad_clip,
             use_amp=use_amp,
-            split_name=f"fold {fold_idx + 1} infer (perturbation)",
+            split_name=f"fold {fold_idx + 1} test (perturbed y_perturbed)",
             perturb=True,
         )
         fold_val_metrics.append(best_val_metrics)
         fold_test_metrics.append(test_metrics)
         fold_infer_metrics.append(infer_metrics)
 
-    print_cv_summary("CV Val Summary", fold_val_metrics)
-    print_cv_summary("CV Test Summary", fold_test_metrics)
-    print_cv_summary("CV Infer Summary", fold_infer_metrics)
+    print_cv_summary("CV Val (unperturbed y)", fold_val_metrics)
+    print_cv_summary("CV Test (unperturbed y)", fold_test_metrics)
+    print_cv_summary("CV Test (perturbed y_perturbed)", fold_infer_metrics)
 
     print("\nDone.")
 
