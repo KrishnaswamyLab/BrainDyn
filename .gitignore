@@ -2,7 +2,7 @@ logs/
 *.npy
 *.pt
 plots/
-*.png
+archive/
 *.npz
 __pycache__/
 checkpoints/
