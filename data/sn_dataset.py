@@ -120,6 +120,10 @@ class SNDataset(Dataset):
         self._pert_n = np.asarray(self._npz["perturbation_n_nodes"], dtype=np.int64)
         self._pert_nodes = np.asarray(self._npz["perturbation_nodes"], dtype=np.int64)
         self._graph_seeds = np.asarray(self._npz["graph_seeds"], dtype=np.int64)
+<<<<<<< Updated upstream
+=======
+        self._adjacency = np.asarray(self._npz["adjacency"], dtype=np.int64)
+>>>>>>> Stashed changes
 
         run_cfg = _read_run_config(path)
         self._perturbation_mode: str | None = run_cfg.get("perturbation_mode")
@@ -199,6 +203,10 @@ class SNDataset(Dataset):
                 "split": self.split,
                 "T": self.n_bins,
                 "n_channels": self.n_channels,
+<<<<<<< Updated upstream
+=======
+                "adjacency": torch.from_numpy(self._adjacency[s].copy()),
+>>>>>>> Stashed changes
             }
             return {"x": x_t, "y": y_t, "meta": meta}
 
@@ -221,6 +229,10 @@ class SNDataset(Dataset):
                 "split": self.split,
                 "T": self.n_bins,
                 "n_channels": self.n_channels,
+<<<<<<< Updated upstream
+=======
+                "adjacency": torch.from_numpy(self._adjacency[s].copy()),
+>>>>>>> Stashed changes
             }
             return {"x": x_t, "y": y_t, "x_perturbed": x_pert_t, "y_perturbed": y_pert_t, "meta": meta}
 
@@ -238,6 +250,7 @@ class SNDataset(Dataset):
                 "split": self.split,
                 "T": self.n_bins,
                 "n_channels": self.n_channels,
+                "adjacency": torch.from_numpy(self._adjacency[s].copy()),
                 "perturbation_start_ms": float(self._pert_start[s]),
                 "perturbation_end_ms": float(self._pert_end[s]),
                 "perturbation_mode": mode,

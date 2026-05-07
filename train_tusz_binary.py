@@ -742,8 +742,6 @@ def main() -> None:
 
     fold_forecast_val_metrics: list[dict[str, float]] = []
     fold_forecast_test_metrics: list[dict[str, float]] = []
-    fold_cls_val_metrics: list[dict[str, float]] = []
-    fold_cls_test_metrics: list[dict[str, float]] = []
 
     print(f"\n=== {args.cv_folds}-Fold CV over train+val (binary TUSZ) ===")
     print(f"Combined CV pool: {len(combined_dataset)} windows | Held-out test: {len(test_loader.dataset)} windows")
@@ -910,139 +908,7 @@ def main() -> None:
         fold_forecast_val_metrics.append(val_forecast)
         fold_forecast_test_metrics.append(test_forecast)
 
-        print(f"\nFold {fold_idx + 1}/{args.cv_folds} | Stage 2: Binary classification")
-        classifier = DynamicsBinaryHead(hidden_dim=args.hidden_dim, dropout=args.cls_dropout).to(device)
-        freeze_module(model, args.freeze_backbone)
-
-        if args.freeze_backbone:
-            cls_params = list(classifier.parameters())
-            print("Classification mode: frozen BrainDyn backbone; training classifier head only.")
-        else:
-            cls_params = [
-                {"params": [p for p in classifier.parameters() if p.requires_grad], "lr": args.lr_cls_head},
-                {"params": [p for p in model.parameters() if p.requires_grad], "lr": args.lr_cls_backbone},
-            ]
-            print("Classification mode: fine-tuning backbone + classifier head.")
-
-        if args.freeze_backbone:
-            optimizer_cls = torch.optim.AdamW(
-                cls_params,
-                lr=args.lr_cls_head,
-                weight_decay=args.weight_decay,
-            )
-        else:
-            optimizer_cls = torch.optim.AdamW(
-                cls_params,
-                weight_decay=args.weight_decay,
-            )
-
-        scheduler_cls = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer_cls,
-            mode="max",
-            factor=0.5,
-            patience=3,
-            min_lr=1e-6,
-        )
-
-        pos_weight = estimate_pos_weight(fold_train_loader) if args.use_pos_weight else None
-        if pos_weight is not None:
-            print(f"Fold {fold_idx + 1}/{args.cv_folds} BCE pos_weight={pos_weight:.4f}")
-
-        fold_classifier_path = classifier_base_path.with_name(
-            f"{classifier_base_path.stem}_fold{fold_idx + 1}{classifier_base_path.suffix}"
-        )
-        best_val_f1 = -1.0
-        for epoch in range(1, args.epochs_cls + 1):
-            train_cls = run_binary_classification_epoch(
-                model=model,
-                classifier=classifier,
-                loader=fold_train_loader,
-                edge_index=edge_index,
-                x_len=args.x_len,
-                rep_source=args.rep_source,
-                optimizer=optimizer_cls,
-                use_amp=args.amp,
-                grad_clip=args.grad_clip,
-                desc=f"fold {fold_idx + 1} cls train [{epoch}/{args.epochs_cls}]",
-                pos_weight=pos_weight,
-            )
-            val_cls = run_binary_classification_epoch(
-                model=model,
-                classifier=classifier,
-                loader=fold_val_loader,
-                edge_index=edge_index,
-                x_len=args.x_len,
-                rep_source=args.rep_source,
-                optimizer=None,
-                use_amp=args.amp,
-                grad_clip=args.grad_clip,
-                desc=f"fold {fold_idx + 1} cls val   [{epoch}/{args.epochs_cls}]",
-                pos_weight=pos_weight,
-            )
-            scheduler_cls.step(val_cls["f1"])
-
-            print(
-                f"Fold {fold_idx + 1}/{args.cv_folds} Epoch {epoch:03d} | "
-                f"train loss={train_cls['loss']:.4f} acc={train_cls['acc']:.4f} precision={train_cls['precision']:.4f} "
-                f"recall={train_cls['recall']:.4f} f1={train_cls['f1']:.4f} aucroc={train_cls['aucroc']:.4f} | "
-                f"val loss={val_cls['loss']:.4f} acc={val_cls['acc']:.4f} precision={val_cls['precision']:.4f} "
-                f"recall={val_cls['recall']:.4f} f1={val_cls['f1']:.4f} aucroc={val_cls['aucroc']:.4f}"
-            )
-
-            if val_cls["f1"] > best_val_f1:
-                best_val_f1 = val_cls["f1"]
-                torch.save(
-                    {
-                        "stage": "classification",
-                        "fold": fold_idx + 1,
-                        "model_state": model.state_dict(),
-                        "classifier_state": classifier.state_dict(),
-                        "edge_index": edge_index.detach().cpu(),
-                        "args": vars(args),
-                        "val_metrics": val_cls,
-                        "label_mapping": {0: "normal", 1: "seizure"},
-                    },
-                    fold_classifier_path,
-                )
-
-        ckpt_cls = torch.load(fold_classifier_path, map_location=device)
-        model.load_state_dict(ckpt_cls["model_state"])
-        classifier.load_state_dict(ckpt_cls["classifier_state"])
-
-        val_cls_best = run_binary_classification_epoch(
-            model=model,
-            classifier=classifier,
-            loader=fold_val_loader,
-            edge_index=edge_index,
-            x_len=args.x_len,
-            rep_source=args.rep_source,
-            optimizer=None,
-            use_amp=args.amp,
-            grad_clip=args.grad_clip,
-            desc=f"fold {fold_idx + 1} cls best-val",
-            pos_weight=pos_weight,
-        )
-        test_cls = run_binary_classification_epoch(
-            model=model,
-            classifier=classifier,
-            loader=test_loader,
-            edge_index=edge_index,
-            x_len=args.x_len,
-            rep_source=args.rep_source,
-            optimizer=None,
-            use_amp=args.amp,
-            grad_clip=args.grad_clip,
-            desc=f"fold {fold_idx + 1} cls test",
-            pos_weight=pos_weight,
-        )
-        print(
-            f"Fold {fold_idx + 1}/{args.cv_folds} Classification | "
-            f"val acc={val_cls_best['acc']:.4f} f1={val_cls_best['f1']:.4f} aucroc={val_cls_best['aucroc']:.4f} | "
-            f"test acc={test_cls['acc']:.4f} f1={test_cls['f1']:.4f} aucroc={test_cls['aucroc']:.4f}"
-        )
-
-        fold_cls_val_metrics.append(val_cls_best)
-        fold_cls_test_metrics.append(test_cls)
+        # Stage 2 (binary classification) skipped.
 
     def _ms(metrics_list: list[dict[str, float]], key: str) -> tuple[float, float]:
         vals = np.asarray([m[key] for m in metrics_list], dtype=np.float64)
@@ -1063,15 +929,7 @@ def main() -> None:
     print(f"  SCC   : {_ms(fold_forecast_test_metrics, 'scc')[0]:.4f} +- {_ms(fold_forecast_test_metrics, 'scc')[1]:.4f}")
     print(f"  DTW   : {_ms(fold_forecast_test_metrics, 'dtw')[0]:.6f} +- {_ms(fold_forecast_test_metrics, 'dtw')[1]:.6f}")
 
-    print("\nClassification Val (mean +- std across folds):")
-    print(f"  Acc   : {_ms(fold_cls_val_metrics, 'acc')[0]:.4f} +- {_ms(fold_cls_val_metrics, 'acc')[1]:.4f}")
-    print(f"  F1    : {_ms(fold_cls_val_metrics, 'f1')[0]:.4f} +- {_ms(fold_cls_val_metrics, 'f1')[1]:.4f}")
-    print(f"  AUCROC: {_ms(fold_cls_val_metrics, 'aucroc')[0]:.4f} +- {_ms(fold_cls_val_metrics, 'aucroc')[1]:.4f}")
 
-    print("\nClassification Test (mean +- std across folds):")
-    print(f"  Acc   : {_ms(fold_cls_test_metrics, 'acc')[0]:.4f} +- {_ms(fold_cls_test_metrics, 'acc')[1]:.4f}")
-    print(f"  F1    : {_ms(fold_cls_test_metrics, 'f1')[0]:.4f} +- {_ms(fold_cls_test_metrics, 'f1')[1]:.4f}")
-    print(f"  AUCROC: {_ms(fold_cls_test_metrics, 'aucroc')[0]:.4f} +- {_ms(fold_cls_test_metrics, 'aucroc')[1]:.4f}")
 
 
 if __name__ == "__main__":
